@@ -1,17 +1,21 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.snapshot import router as snapshot_router
+from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
+from app.api import snapshot, auth, parking
 
-app = FastAPI(title=settings.PROJECT_NAME)
+app = FastAPI(title="ANPR Cloud Suite")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Register your routes
-app.include_router(snapshot_router, prefix="/v1", tags=["ANPR"])
+app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
+
+app.include_router(auth.router, prefix="/v1/auth", tags=["Auth"])
+app.include_router(snapshot.router, prefix="/v1", tags=["Snapshot ANPR"])
+app.include_router(parking.router, prefix="/v1/parking", tags=["Parking & Access Control"])

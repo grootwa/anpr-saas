@@ -291,7 +291,7 @@ def get_all_candidates_from_blocks(blocks):
 
 # MAIN CELERY WORKER TASK
 @celery.task(name="process_anpr_pipeline")
-def process_anpr_pipeline(task_id: str, file_paths: list, user_id: int):
+def process_anpr_pipeline(task_id: str, file_paths: list, user_id: int, app_source: str = "snapshot"):
     print(f"\n[Worker] 📥 Picked up task {task_id} | Analyzing {len(file_paths)} frames for User {user_id}")
     
     master_candidate_pool = []
@@ -377,6 +377,7 @@ def process_anpr_pipeline(task_id: str, file_paths: list, user_id: int):
     try:
         new_log = ANPRLog(
             user_id=user_id,
+            app_source=app_source,
             task_id=task_id,
             image_path=file_paths[0] if file_paths else "",
             plate_number=plate_text,
@@ -386,7 +387,7 @@ def process_anpr_pipeline(task_id: str, file_paths: list, user_id: int):
         )
         db.add(new_log)
         db.commit()
-        print(f"[Worker] 💾 Saved {plate_text} to MySQL database for User {user_id}")
+        print(f"[Worker] 💾 Saved {plate_text} ({app_source}) to MySQL database for User {user_id}")
     except Exception as e:
         db.rollback()
         print(f"[Worker] ❌ Database Error: {e}")
