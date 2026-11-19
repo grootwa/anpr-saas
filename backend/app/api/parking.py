@@ -131,26 +131,54 @@ def process_gate_event(req: GateEventRequest, db: Session = Depends(get_db)):
     }
 
 @router.get("/sessions")
-def list_sessions(user_id: int = Query(...), status: Optional[str] = Query(None), db: Session = Depends(get_db)):
+def list_sessions(
+    user_id: int = Query(...),
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(15, ge=5, le=100),
+    db: Session = Depends(get_db)
+):
     q = db.query(ParkingSession).filter(ParkingSession.user_id == user_id)
+
     if status and status != "ALL":
         q = q.filter(ParkingSession.status == status)
-    rows = q.order_by(ParkingSession.entry_time.desc()).limit(100).all()
-    return [
-        {
-            "id": r.id,
-            "plate_number": r.plate_number,
-            "access_type": r.access_type,
-            "gate_action": r.gate_action,
-            "entry_time": r.entry_time.isoformat() if r.entry_time else None,
-            "exit_time": r.exit_time.isoformat() if r.exit_time else None,
-            "duration_mins": r.duration_mins,
-            "fee_inr": r.fee_inr,
-            "status": r.status,
-            "image_url": f"http://localhost:8000/{r.entry_image.replace(chr(92), '/')}" if r.entry_image else None
-        }
-        for r in rows
-    ]
+
+    if search and search.strip():
+        clean_search = search.strip().upper().replace(" ", "")
+        q = q.filter(
+            (ParkingSession.plate_number.ilike(f"%{clean_search}%")) |
+            (ParkingSession.access_type.ilike(f"%{clean_search}%"))
+        )
+
+    total = q.count()
+    total_pages = max(1, math.ceil(total / page_size))
+    offset = (page - 1) * page_size
+
+    rows = q.order_by(ParkingSession.entry_time.desc()).offset(offset).limit(page_size).all()
+
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "plate_number": r.plate_number,
+                "access_type": r.access_type,
+                "gate_action": r.gate_action,
+                "entry_time": r.entry_time.isoformat() if r.entry_time else None,
+                "exit_time": r.exit_time.isoformat() if r.exit_time else None,
+                "duration_mins": r.duration_mins,
+                "fee_inr": r.fee_inr,
+                "status": r.status,
+                "image_url": f"http://localhost:8000/{r.entry_image.replace(chr(92), '/')}" if r.entry_image else None
+            }
+            for r in rows
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
+
 
 @router.get("/rules")
 def list_rules(user_id: int = Query(...), db: Session = Depends(get_db)):

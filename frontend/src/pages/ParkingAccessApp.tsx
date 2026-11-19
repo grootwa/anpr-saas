@@ -14,9 +14,17 @@ import {
   Clock,
   Plus,
   Trash2,
-  RefreshCw
+  RefreshCw,
+  RotateCcw,
+  CheckCircle2,
+  AlertCircle,
+  Search,
+  Maximize2
 } from "lucide-react"
 import type { UserSession } from "../App"
+import IndianPlateBadge from "../components/IndianPlateBadge"
+import ImageLightbox from "../components/ImageLightbox"
+import PaginationBar from "../components/PaginationBar"
 
 interface ParkingAppProps {
   user: UserSession
@@ -46,12 +54,30 @@ interface VehicleRuleItem {
 const API_BASE = "http://localhost:8000"
 
 export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps) {
-  const [subTab, setSubTab] = useState<"gate" | "sessions" | "rules">("gate")
-  const [gateDirection, setGateDirection] = useState<"ENTRY" | "EXIT">("ENTRY")
+  const [subTab, setSubTab] = useState<"gate" | "sessions" | "rules">(() => {
+    const saved = localStorage.getItem("anpr_parking_subtab")
+    if (saved === "gate" || saved === "sessions" || saved === "rules") {
+      return saved
+    }
+    return "gate"
+  })
 
-  // Gate Capture State
+  const [gateDirection, setGateDirection] = useState<"ENTRY" | "EXIT">(() => {
+    const saved = localStorage.getItem("anpr_parking_direction")
+    return saved === "EXIT" ? "EXIT" : "ENTRY"
+  })
+
+  useEffect(() => {
+    localStorage.setItem("anpr_parking_subtab", subTab)
+  }, [subTab])
+
+  useEffect(() => {
+    localStorage.setItem("anpr_parking_direction", gateDirection)
+  }, [gateDirection])
+
   const [file, setFile] = useState<File | null>(null)
   const [preview, setPreview] = useState<string | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
   const [processingState, setProcessingState] = useState<"idle" | "scanning" | "done" | "error">("idle")
   const [gateBanner, setGateBanner] = useState<{
     action: string
@@ -60,45 +86,106 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
     message: string
     fee_inr?: number
   } | null>(null)
+  const [manualPlateInput, setManualPlateInput] = useState("")
+  const [toast, setToast] = useState<{ type: "success" | "error"; text: string } | null>(null)
 
-  // Persistent Data from MySQL
+  // Persistent Data & Server-Side Pagination State
   const [sessions, setSessions] = useState<ParkingSessionItem[]>([])
+  const [sessionSearch, setSessionSearch] = useState("")
+  const [sessionStatusFilter, setSessionStatusFilter] = useState<"ALL" | "PARKED" | "EXITED" | "BLOCKED">("ALL")
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(15)
+  const [totalItems, setTotalItems] = useState(0)
+  const [totalPages, setTotalPages] = useState(1)
+
   const [rules, setRules] = useState<VehicleRuleItem[]>([])
   const [newPlate, setNewPlate] = useState("")
   const [newRuleType, setNewRuleType] = useState<"WHITELIST" | "BLACKLIST">("WHITELIST")
   const [newLabel, setNewLabel] = useState("")
   const [loadingData, setLoadingData] = useState(false)
+  const [lightboxItem, setLightboxItem] = useState<ParkingSessionItem | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const showToast = (type: "success" | "error", text: string) => {
+    setToast({ type, text })
+    setTimeout(() => setToast(null), 3500)
+  }
+
+  const applySelectedFile = useCallback((selected: File) => {
+    if (!selected.type.startsWith("image/")) {
+      showToast("error", "Please select a valid image file.")
+      return
+    }
+    setFile(selected)
+    setPreview(URL.createObjectURL(selected))
+    setProcessingState("idle")
+    setGateBanner(null)
+  }, [])
+
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      if (subTab !== "gate") return
+      const items = e.clipboardData?.items
+      if (!items) return
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          const pasted = item.getAsFile()
+          if (pasted) {
+            applySelectedFile(pasted)
+            showToast("success", "Gate frame pasted from clipboard")
+          }
+          break
+        }
+      }
+    }
+    window.addEventListener("paste", handlePaste)
+    return () => window.removeEventListener("paste", handlePaste)
+  }, [subTab, applySelectedFile])
 
   const fetchParkingData = useCallback(async () => {
     setLoadingData(true)
     try {
+      const params = new URLSearchParams({
+        user_id: String(user.id),
+        page: String(page),
+        page_size: String(pageSize)
+      })
+      if (sessionSearch.trim()) params.append("search", sessionSearch.trim())
+      if (sessionStatusFilter !== "ALL") params.append("status", sessionStatusFilter)
+
       const [sessRes, rulesRes] = await Promise.all([
-        fetch(`${API_BASE}/v1/parking/sessions?user_id=${user.id}`),
+        fetch(`${API_BASE}/v1/parking/sessions?${params.toString()}`),
         fetch(`${API_BASE}/v1/parking/rules?user_id=${user.id}`)
       ])
-      if (sessRes.ok) setSessions(await sessRes.json())
-      if (rulesRes.ok) setRules(await rulesRes.json())
-    } catch (err) {
-      console.error(err)
+
+      if (sessRes.ok) {
+        const data = await sessRes.json()
+        setSessions(data.items || [])
+        setTotalItems(data.total || 0)
+        setTotalPages(data.total_pages || 1)
+      }
+      if (rulesRes.ok) {
+        setRules(await rulesRes.json())
+      }
+    } catch {
+      showToast("error", "Failed to sync gate records.")
     } finally {
       setLoadingData(false)
     }
-  }, [user.id])
+  }, [user.id, page, pageSize, sessionSearch, sessionStatusFilter])
 
   useEffect(() => {
     fetchParkingData()
   }, [fetchParkingData])
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const selected = e.target.files[0]
-      setFile(selected)
-      setPreview(URL.createObjectURL(selected))
-      setProcessingState("idle")
-      setGateBanner(null)
-    }
+  const handleResetGate = () => {
+    setFile(null)
+    setPreview(null)
+    setProcessingState("idle")
+    setGateBanner(null)
+    setManualPlateInput("")
+    if (fileInputRef.current) fileInputRef.current.value = ""
   }
 
   const triggerGateLogic = async (plate: string, imagePath?: string) => {
@@ -148,7 +235,7 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
           clearInterval(poll)
           setProcessingState("error")
         }
-      }, 800)
+      }, 700)
     } catch {
       setProcessingState("error")
     }
@@ -167,6 +254,7 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
         owner_label: newLabel
       })
     })
+    showToast("success", `Saved ${newPlate.toUpperCase()} to ${newRuleType}`)
     setNewPlate("")
     setNewLabel("")
     fetchParkingData()
@@ -174,16 +262,35 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
 
   const handleDeleteRule = async (ruleId: number) => {
     await fetch(`${API_BASE}/v1/parking/rules/${ruleId}`, { method: "DELETE" })
+    showToast("success", "Rule removed")
     fetchParkingData()
   }
 
-  // Computed KPI metrics
   const activeParkedCount = sessions.filter((s) => s.status === "PARKED").length
   const blockedCount = sessions.filter((s) => s.status === "BLOCKED").length
   const totalRevenue = sessions.reduce((acc, s) => acc + (s.fee_inr || 0), 0)
 
   return (
     <div className="min-h-screen w-screen bg-slate-950 text-slate-100 flex flex-col">
+      {toast && (
+        <div
+          className={`fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-xl border text-xs font-semibold shadow-xl flex items-center space-x-2 ${
+            toast.type === "success"
+              ? "bg-emerald-950/90 border-emerald-500/50 text-emerald-200"
+              : "bg-rose-950/90 border-rose-500/50 text-rose-200"
+          }`}
+        >
+          {toast.type === "success" ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <AlertCircle className="w-4 h-4 text-rose-400" />}
+          <span>{toast.text}</span>
+        </div>
+      )}
+
+      <ImageLightbox
+        imageUrl={lightboxItem?.image_url || null}
+        plateNumber={lightboxItem?.plate_number}
+        onClose={() => setLightboxItem(null)}
+      />
+
       {/* TOP BAR */}
       <header className="h-16 bg-slate-900 border-b border-slate-800 px-8 flex items-center justify-between">
         <div className="flex items-center space-x-4">
@@ -221,7 +328,7 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
               subTab === "sessions" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
             }`}
           >
-            Parking Sessions
+            Parking Sessions ({totalItems})
           </button>
           <button
             onClick={() => setSubTab("rules")}
@@ -229,7 +336,7 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
               subTab === "rules" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
             }`}
           >
-            Whitelist & Watchlist
+            Whitelist & Watchlist ({rules.length})
           </button>
         </div>
 
@@ -243,7 +350,7 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
       </header>
 
       <main className="flex-1 p-8 max-w-[1600px] w-full mx-auto space-y-6">
-        {/* PARKING & ACCESS KPI STRIP */}
+        {/* KPI STRIP */}
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
             <div>
@@ -283,15 +390,13 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
         {/* TAB 1: LIVE GATE CONTROL */}
         {subTab === "gate" && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* GATE CAMERA & BARRIER PANEL */}
             <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-5">
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-base font-semibold text-white">Boom Barrier Simulator</h2>
-                  <p className="text-xs text-slate-400">Select gate lane direction and capture vehicle</p>
+                  <p className="text-xs text-slate-400">Drop, click, or paste frame • Select lane direction</p>
                 </div>
 
-                {/* ENTRY / EXIT LANE SELECTOR */}
                 <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800">
                   <button
                     onClick={() => setGateDirection("ENTRY")}
@@ -316,9 +421,29 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
 
               <div
                 onClick={() => fileInputRef.current?.click()}
-                className="border-2 border-dashed border-slate-700 hover:border-emerald-500 rounded-xl p-6 text-center cursor-pointer bg-slate-950/60"
+                onDragOver={(e) => {
+                  e.preventDefault()
+                  setIsDragging(true)
+                }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  setIsDragging(false)
+                  if (e.dataTransfer.files?.[0]) applySelectedFile(e.dataTransfer.files[0])
+                }}
+                className={`border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-all ${
+                  isDragging
+                    ? "border-emerald-400 bg-emerald-950/20"
+                    : "border-slate-700 hover:border-emerald-500 bg-slate-950/60"
+                }`}
               >
-                <input type="file" className="hidden" ref={fileInputRef} accept="image/*" onChange={handleFileSelect} />
+                <input
+                  type="file"
+                  className="hidden"
+                  ref={fileInputRef}
+                  accept="image/*"
+                  onChange={(e) => e.target.files?.[0] && applySelectedFile(e.target.files[0])}
+                />
                 {preview ? (
                   <div className="w-full aspect-video rounded-lg overflow-hidden border border-slate-700">
                     <img src={preview} alt="Gate Frame" className="w-full h-full object-cover" />
@@ -329,33 +454,44 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
                     <p className="text-sm font-medium text-slate-200">
                       Capture {gateDirection} Lane Vehicle Frame
                     </p>
-                    <p className="text-xs text-slate-500">Triggers ANPR + Whitelist/Tariff Engine</p>
+                    <p className="text-xs text-slate-500">Click, drop image, or press Ctrl+V</p>
                   </div>
                 )}
               </div>
 
-              <button
-                disabled={!file || processingState === "scanning"}
-                onClick={handleGateScan}
-                className={`w-full py-3 rounded-lg font-semibold text-sm flex items-center justify-center transition-colors ${
-                  !file || processingState === "scanning"
-                    ? "bg-slate-800 text-slate-500 cursor-not-allowed"
-                    : "bg-emerald-600 hover:bg-emerald-500 text-white"
-                }`}
-              >
-                {processingState === "scanning" ? (
-                  <>
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Verifying Plate & Access Rules...
-                  </>
-                ) : (
-                  <span>Process {gateDirection} Gate Vehicle</span>
-                )}
-              </button>
+              <div className="flex gap-2">
+                <button
+                  disabled={!file || processingState === "scanning"}
+                  onClick={handleGateScan}
+                  className={`flex-1 py-3 rounded-lg font-semibold text-sm flex items-center justify-center transition-colors ${
+                    !file || processingState === "scanning"
+                      ? "bg-slate-800 text-slate-500 cursor-not-allowed"
+                      : "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20"
+                  }`}
+                >
+                  {processingState === "scanning" ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Verifying Plate & Access Rules...
+                    </>
+                  ) : (
+                    <span>Process {gateDirection} Gate Vehicle</span>
+                  )}
+                </button>
 
-              {/* BARRIER ACTUATION RESULT BANNER */}
+                {file && (
+                  <button
+                    onClick={handleResetGate}
+                    title="Next Vehicle"
+                    className="px-3.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+
               {gateBanner && (
                 <div
-                  className={`p-4 rounded-xl border space-y-2 ${
+                  className={`p-4 rounded-xl border space-y-3 ${
                     gateBanner.action === "LOCKED"
                       ? "bg-rose-950/60 border-rose-500/50 text-rose-200"
                       : gateBanner.action === "OPENED"
@@ -363,41 +499,57 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
                       : "bg-amber-950/60 border-amber-500/50 text-amber-200"
                   }`}
                 >
-                  <div className="flex items-center justify-between">
-                    <span className="font-mono text-xl font-bold tracking-wider text-white">
-                      {gateBanner.plate_number || "UNKNOWN"}
-                    </span>
-                    <span className="flex items-center space-x-1 text-xs font-bold uppercase px-2.5 py-1 rounded bg-black/30">
+                  <div className="flex items-center justify-between gap-2">
+                    <IndianPlateBadge plate={gateBanner.plate_number} size="lg" />
+                    <span className="flex items-center space-x-1 text-xs font-bold uppercase px-2.5 py-1.5 rounded bg-black/40 shrink-0">
                       {gateBanner.action === "OPENED" ? (
                         <>
                           <LockOpen className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>BARRIER OPENED</span>
+                          <span>OPENED</span>
                         </>
                       ) : (
                         <>
                           <Lock className="w-3.5 h-3.5 text-rose-400" />
-                          <span>BARRIER LOCKED</span>
+                          <span>LOCKED</span>
                         </>
                       )}
                     </span>
                   </div>
+
                   <p className="text-xs font-medium">{gateBanner.message}</p>
+
+                  {gateBanner.action === "MANUAL_REVIEW" && (
+                    <div className="pt-2 border-t border-amber-500/30 flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="Enter plate manually (e.g. JH01AB1234)"
+                        value={manualPlateInput}
+                        onChange={(e) => setManualPlateInput(e.target.value)}
+                        className="flex-1 px-3 py-1.5 bg-slate-950 border border-slate-700 rounded text-xs font-mono uppercase text-white"
+                      />
+                      <button
+                        onClick={() => manualPlateInput.trim() && triggerGateLogic(manualPlateInput)}
+                        className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold rounded"
+                      >
+                        Override & Open
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
 
-            {/* LIVE PARKING LOT & GATE FEED */}
             <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-6 flex flex-col">
               <div className="mb-4">
                 <h2 className="text-base font-semibold text-white">Live Gate & Parking Activity</h2>
-                <p className="text-xs text-slate-400">Real-time entry/exit status, duration, and visitor billing</p>
+                <p className="text-xs text-slate-400">Click any row to inspect the captured gate frame</p>
               </div>
 
               <div className="overflow-x-auto flex-1">
                 <table className="w-full text-left border-collapse">
                   <thead>
                     <tr className="border-b border-slate-800 text-[11px] font-semibold uppercase text-slate-400">
-                      <th className="py-3 px-3">Plate</th>
+                      <th className="py-3 px-3">Vehicle Plate</th>
                       <th className="py-3 px-3">Access Type</th>
                       <th className="py-3 px-3">Entry Time</th>
                       <th className="py-3 px-3">Duration</th>
@@ -414,8 +566,14 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
                       </tr>
                     ) : (
                       sessions.slice(0, 10).map((s) => (
-                        <tr key={s.id} className="hover:bg-slate-800/40">
-                          <td className="py-3 px-3 font-mono font-bold text-sm text-white">{s.plate_number}</td>
+                        <tr
+                          key={s.id}
+                          onClick={() => s.image_url && setLightboxItem(s)}
+                          className={`hover:bg-slate-800/40 ${s.image_url ? "cursor-pointer" : ""}`}
+                        >
+                          <td className="py-3 px-3">
+                            <IndianPlateBadge plate={s.plate_number} size="sm" />
+                          </td>
                           <td className="py-3 px-3">
                             <span
                               className={`px-2 py-0.5 rounded text-[10px] font-bold ${
@@ -432,9 +590,11 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
                           <td className="py-3 px-3 text-slate-400">
                             {s.entry_time ? new Date(s.entry_time).toLocaleTimeString() : "-"}
                           </td>
-                          <td className="py-3 px-3 text-slate-300 flex items-center gap-1">
-                            <Clock className="w-3 h-3 text-slate-500" />
-                            {s.status === "PARKED" ? "Active" : `${s.duration_mins}m`}
+                          <td className="py-3 px-3 text-slate-300">
+                            <span className="inline-flex items-center gap-1">
+                              <Clock className="w-3 h-3 text-slate-500" />
+                              {s.status === "PARKED" ? "Active" : `${s.duration_mins}m`}
+                            </span>
                           </td>
                           <td className="py-3 px-3 font-semibold text-white">₹{s.fee_inr.toFixed(0)}</td>
                           <td className="py-3 px-3">
@@ -460,15 +620,49 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
           </div>
         )}
 
-        {/* TAB 2: FULL PARKING SESSIONS */}
+        {/* TAB 2: FULL PARKING SESSIONS WITH SERVER-SIDE PAGINATION & SEARCH */}
         {subTab === "sessions" && (
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
-            <h2 className="text-base font-semibold text-white mb-4">Complete Parking & Gate Audit Log</h2>
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <h2 className="text-base font-semibold text-white">Complete Parking & Gate Audit Log</h2>
+
+              <div className="flex items-center space-x-3">
+                <div className="relative">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2" />
+                  <input
+                    type="text"
+                    placeholder="Filter by plate..."
+                    value={sessionSearch}
+                    onChange={(e) => {
+                      setSessionSearch(e.target.value)
+                      setPage(1)
+                    }}
+                    className="pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+
+                <select
+                  value={sessionStatusFilter}
+                  onChange={(e) => {
+                    setSessionStatusFilter(e.target.value as any)
+                    setPage(1)
+                  }}
+                  className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white focus:outline-none"
+                >
+                  <option value="ALL">All Statuses</option>
+                  <option value="PARKED">Currently Parked</option>
+                  <option value="EXITED">Exited</option>
+                  <option value="BLOCKED">Blocked Alerts</option>
+                </select>
+              </div>
+            </div>
+
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-800 text-xs font-semibold uppercase text-slate-400">
                     <th className="py-3 px-4">ID</th>
+                    <th className="py-3 px-4">Snapshot</th>
                     <th className="py-3 px-4">Plate Number</th>
                     <th className="py-3 px-4">Category</th>
                     <th className="py-3 px-4">Entry</th>
@@ -479,25 +673,62 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800 text-xs">
-                  {sessions.map((s) => (
-                    <tr key={s.id} className="hover:bg-slate-800/40">
-                      <td className="py-3 px-4 text-slate-400">#{s.id}</td>
-                      <td className="py-3 px-4 font-mono font-bold text-sm text-white">{s.plate_number}</td>
-                      <td className="py-3 px-4 text-slate-300">{s.access_type}</td>
-                      <td className="py-3 px-4 text-slate-400">
-                        {s.entry_time ? new Date(s.entry_time).toLocaleString() : "-"}
+                  {sessions.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="py-12 text-center text-slate-500">
+                        No matching parking sessions found.
                       </td>
-                      <td className="py-3 px-4 text-slate-400">
-                        {s.exit_time ? new Date(s.exit_time).toLocaleString() : "-"}
-                      </td>
-                      <td className="py-3 px-4 text-slate-300">{s.duration_mins} mins</td>
-                      <td className="py-3 px-4 font-semibold text-amber-400">₹{s.fee_inr.toFixed(0)}</td>
-                      <td className="py-3 px-4 font-semibold text-white">{s.status}</td>
                     </tr>
-                  ))}
+                  ) : (
+                    sessions.map((s) => (
+                      <tr key={s.id} className="hover:bg-slate-800/40">
+                        <td className="py-3 px-4 text-slate-400">#{s.id}</td>
+                        <td className="py-3 px-4">
+                          {s.image_url ? (
+                            <button
+                              onClick={() => setLightboxItem(s)}
+                              className="relative group block rounded overflow-hidden border border-slate-700"
+                            >
+                              <img src={s.image_url} alt={s.plate_number} className="w-16 h-10 object-cover" />
+                              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                                <Maximize2 className="w-3.5 h-3.5 text-white" />
+                              </div>
+                            </button>
+                          ) : (
+                            <span className="text-slate-600">—</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4">
+                          <IndianPlateBadge plate={s.plate_number} size="sm" />
+                        </td>
+                        <td className="py-3 px-4 text-slate-300">{s.access_type}</td>
+                        <td className="py-3 px-4 text-slate-400">
+                          {s.entry_time ? new Date(s.entry_time).toLocaleString() : "-"}
+                        </td>
+                        <td className="py-3 px-4 text-slate-400">
+                          {s.exit_time ? new Date(s.exit_time).toLocaleString() : "-"}
+                        </td>
+                        <td className="py-3 px-4 text-slate-300">{s.duration_mins} mins</td>
+                        <td className="py-3 px-4 font-semibold text-amber-400">₹{s.fee_inr.toFixed(0)}</td>
+                        <td className="py-3 px-4 font-semibold text-white">{s.status}</td>
+                      </tr>
+                    ))
+                  )}
                 </tbody>
               </table>
             </div>
+
+            <PaginationBar
+              page={page}
+              totalPages={totalPages}
+              totalItems={totalItems}
+              pageSize={pageSize}
+              onPageChange={setPage}
+              onPageSizeChange={(sz) => {
+                setPageSize(sz)
+                setPage(1)
+              }}
+            />
           </div>
         )}
 
@@ -562,7 +793,7 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
                   rules.map((r) => (
                     <div key={r.id} className="py-3 flex items-center justify-between">
                       <div className="flex items-center space-x-4">
-                        <span className="font-mono font-bold text-sm text-white">{r.plate_number}</span>
+                        <IndianPlateBadge plate={r.plate_number} size="sm" />
                         <span
                           className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                             r.rule_type === "WHITELIST"

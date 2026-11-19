@@ -1,6 +1,7 @@
 import os
 import uuid
 import shutil
+import math
 from typing import Optional
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
@@ -63,7 +64,8 @@ def get_anpr_logs(
     app_source: str = Query("snapshot"),
     search: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    limit: int = Query(50, le=200),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(15, ge=5, le=100),
     db: Session = Depends(get_db)
 ):
     query = db.query(ANPRLog).filter(
@@ -71,28 +73,100 @@ def get_anpr_logs(
         ANPRLog.app_source == app_source
     )
 
-    if search:
+    if search and search.strip():
         clean_search = search.strip().upper().replace(" ", "")
-        query = query.filter(ANPRLog.plate_number.ilike(f"%{clean_search}%"))
+        query = query.filter(
+            (ANPRLog.plate_number.ilike(f"%{clean_search}%")) |
+            (ANPRLog.category.ilike(f"%{clean_search}%"))
+        )
 
     if status and status != "ALL":
         query = query.filter(ANPRLog.status == status)
 
-    logs = query.order_by(ANPRLog.created_at.desc()).limit(limit).all()
+    total = query.count()
+    total_pages = max(1, math.ceil(total / page_size))
+    offset = (page - 1) * page_size
 
-    return [
-        {
-            "id": log.id,
-            "task_id": log.task_id,
-            "plate_number": log.plate_number,
-            "category": log.category or "UNKNOWN",
-            "confidence": log.confidence,
-            "status": log.status,
-            "image_url": f"http://localhost:8000/{log.image_path.replace(chr(92), '/')}",
-            "created_at": log.created_at.isoformat() if log.created_at else None,
-        }
-        for log in logs
-    ]
+    logs = query.order_by(ANPRLog.created_at.desc()).offset(offset).limit(page_size).all()
+
+    return {
+        "items": [
+            {
+                "id": log.id,
+                "task_id": log.task_id,
+                "plate_number": log.plate_number,
+                "category": log.category or "UNKNOWN",
+                "confidence": log.confidence,
+                "status": log.status,
+                "image_url": f"http://localhost:8000/{log.image_path.replace(chr(92), '/')}",
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+            }
+            for log in logs
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
+
+
+@router.get("/search")
+def global_search(
+    user_id: int = Query(...),
+    q: str = Query(..., min_length=2),
+    limit: int = Query(15, le=50),
+    db: Session = Depends(get_db)
+):
+    clean_q = q.strip().upper().replace(" ", "")
+
+    snapshot_hits = (
+        db.query(ANPRLog)
+        .filter(
+            ANPRLog.user_id == user_id,
+            ANPRLog.app_source == "snapshot",
+            ANPRLog.plate_number.ilike(f"%{clean_q}%"),
+        )
+        .order_by(ANPRLog.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    parking_hits = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.user_id == user_id,
+            ParkingSession.plate_number.ilike(f"%{clean_q}%"),
+        )
+        .order_by(ParkingSession.entry_time.desc())
+        .limit(limit)
+        .all()
+    )
+
+    results = []
+    for s in snapshot_hits:
+        results.append({
+            "id": f"snap-{s.id}",
+            "app": "snapshot",
+            "app_label": "Snapshot Studio",
+            "plate_number": s.plate_number,
+            "meta": f"{s.category or 'STANDARD'} • {s.confidence}% Conf",
+            "timestamp": s.created_at.isoformat() if s.created_at else None,
+            "image_url": f"http://localhost:8000/{s.image_path.replace(chr(92), '/')}" if s.image_path else None,
+        })
+
+    for p in parking_hits:
+        results.append({
+            "id": f"park-{p.id}",
+            "app": "parking",
+            "app_label": "Parking & Access",
+            "plate_number": p.plate_number,
+            "meta": f"{p.access_type} • {p.status} • ₹{p.fee_inr:.0f}",
+            "timestamp": p.entry_time.isoformat() if p.entry_time else None,
+            "image_url": f"http://localhost:8000/{p.entry_image.replace(chr(92), '/')}" if p.entry_image else None,
+        })
+
+    results.sort(key=lambda x: x["timestamp"] or "", reverse=True)
+    return {"query": clean_q, "results": results[:limit]}
 
 @router.get("/stats")
 def get_anpr_stats(
