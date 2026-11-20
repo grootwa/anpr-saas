@@ -1,7 +1,10 @@
 import json
+import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
+from zoneinfo import ZoneInfo
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -14,7 +17,11 @@ from app.core.database import (
     OrganizationConfig,
 )
 
+logger = logging.getLogger("anpr.parking")
 router = APIRouter()
+
+IST = ZoneInfo("Asia/Kolkata")
+GATE_DEBOUNCE_SECONDS = 20
 
 
 def get_db():
@@ -23,6 +30,26 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def to_utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    """Ensure MySQL naive UTC datetimes serialize with +00:00 so browsers render IST."""
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+def get_ist_day_start_utc() -> datetime:
+    """Return midnight Asia/Kolkata converted to UTC for accurate Indian daily stats."""
+    now_ist = datetime.now(IST)
+    midnight_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_ist.astimezone(timezone.utc)
+
+
+def normalize_plate(raw: str) -> str:
+    return "".join(ch for ch in (raw or "").upper().strip() if ch.isalnum())
 
 
 class OrgConfigRequest(BaseModel):
@@ -65,10 +92,6 @@ class GateEventRequest(BaseModel):
     gate_label: Optional[str] = "Manual Console"
     vehicle_type: Optional[str] = "4W"
     image_path: Optional[str] = None
-
-
-def normalize_plate(raw: str) -> str:
-    return "".join(ch for ch in (raw or "").upper().strip() if ch.isalnum())
 
 
 def calculate_dynamic_tariff(
@@ -139,6 +162,7 @@ def process_gate_decision(
     now_utc = datetime.now(timezone.utc)
 
     if not clean_plate or clean_plate == "NOTEXTDETECTED":
+        logger.warning("[Gate:%s] Unreadable plate dropped (raw=%r)", gate_label, plate_number)
         return {
             "action": "MANUAL_REVIEW",
             "access_type": "UNKNOWN",
@@ -147,47 +171,134 @@ def process_gate_decision(
             "fee_inr": 0.0,
         }
 
-    reg = (
-        db.query(RegisteredVehicle)
-        .filter(
-            RegisteredVehicle.user_id == user_id,
-            RegisteredVehicle.plate_number == clean_plate,
+    try:
+        reg = (
+            db.query(RegisteredVehicle)
+            .filter(
+                RegisteredVehicle.user_id == user_id,
+                RegisteredVehicle.plate_number == clean_plate,
+            )
+            .first()
         )
-        .first()
-    )
 
-    access_type = reg.access_status.upper() if reg else "VISITOR"
-    vehicle_type = reg.vehicle_type if reg else detected_vtype
-    parking_type = reg.parking_type if reg else "VISITOR"
+        access_type = reg.access_status.upper() if reg else "VISITOR"
+        vehicle_type = reg.vehicle_type if reg else detected_vtype
+        parking_type = reg.parking_type if reg else "VISITOR"
 
-    if access_type == "BLACKLIST":
-        blocked = ParkingSession(
-            user_id=user_id,
-            plate_number=clean_plate,
-            vehicle_type=vehicle_type,
-            parking_type=parking_type,
-            access_type="BLACKLIST",
-            gate_action="LOCKED",
-            entry_gate=gate_label if lane_dir == "ENTRY" else None,
-            exit_gate=gate_label if lane_dir == "EXIT" else None,
-            entry_time=now_utc,
-            duration_mins=0,
-            fee_inr=0.0,
-            status="BLOCKED",
-            entry_image=image_path if lane_dir == "ENTRY" else None,
-            exit_image=image_path if lane_dir == "EXIT" else None,
+        if access_type == "BLACKLIST":
+            recent_block = (
+                db.query(ParkingSession)
+                .filter(
+                    ParkingSession.user_id == user_id,
+                    ParkingSession.plate_number == clean_plate,
+                    ParkingSession.status == "BLOCKED",
+                    ParkingSession.entry_time >= now_utc - timedelta(seconds=GATE_DEBOUNCE_SECONDS),
+                )
+                .first()
+            )
+            if recent_block:
+                return {
+                    "action": "LOCKED",
+                    "access_type": "BLACKLIST",
+                    "plate_number": clean_plate,
+                    "message": f"ALERT (Debounced): Blacklisted {clean_plate} at {gate_label}",
+                    "fee_inr": 0.0,
+                }
+
+            blocked = ParkingSession(
+                user_id=user_id,
+                plate_number=clean_plate,
+                vehicle_type=vehicle_type,
+                parking_type=parking_type,
+                access_type="BLACKLIST",
+                gate_action="LOCKED",
+                entry_gate=gate_label if lane_dir == "ENTRY" else None,
+                exit_gate=gate_label if lane_dir == "EXIT" else None,
+                entry_time=now_utc,
+                duration_mins=0,
+                fee_inr=0.0,
+                status="BLOCKED",
+                entry_image=image_path if lane_dir == "ENTRY" else None,
+                exit_image=image_path if lane_dir == "EXIT" else None,
+            )
+            db.add(blocked)
+            db.commit()
+            logger.warning("[Gate:%s] BLACKLIST blocked plate=%s", gate_label, clean_plate)
+            return {
+                "action": "LOCKED",
+                "access_type": "BLACKLIST",
+                "plate_number": clean_plate,
+                "message": f"ALERT: Blacklisted vehicle {clean_plate} at {gate_label}!",
+                "fee_inr": 0.0,
+            }
+
+        if lane_dir == "ENTRY":
+            active = (
+                db.query(ParkingSession)
+                .filter(
+                    ParkingSession.user_id == user_id,
+                    ParkingSession.plate_number == clean_plate,
+                    ParkingSession.status == "PARKED",
+                )
+                .first()
+            )
+            if active:
+                logger.info("[Gate:%s] Duplicate ENTRY ignored for already-parked plate=%s", gate_label, clean_plate)
+                return {
+                    "action": "OPENED",
+                    "access_type": access_type,
+                    "plate_number": clean_plate,
+                    "message": f"{clean_plate} already inside (Session #{active.id}).",
+                    "fee_inr": 0.0,
+                }
+
+            sess = ParkingSession(
+                user_id=user_id,
+                plate_number=clean_plate,
+                vehicle_type=vehicle_type,
+                parking_type=parking_type,
+                access_type=access_type,
+                gate_action="OPENED",
+                entry_gate=gate_label,
+                entry_time=now_utc,
+                duration_mins=0,
+                fee_inr=0.0,
+                status="PARKED",
+                entry_image=image_path,
+            )
+            db.add(sess)
+            db.commit()
+            owner_tag = f" • {reg.owner_name}" if reg else ""
+            logger.info("[Gate:%s] ENTRY recorded plate=%s type=%s access=%s", gate_label, clean_plate, vehicle_type, access_type)
+            return {
+                "action": "OPENED",
+                "access_type": access_type,
+                "plate_number": clean_plate,
+                "message": f"ENTRY ({gate_label}): {clean_plate} [{vehicle_type}]{owner_tag}",
+                "fee_inr": 0.0,
+            }
+
+        # EXIT FLOW — first check if this plate just exited within debounce window
+        recent_exit = (
+            db.query(ParkingSession)
+            .filter(
+                ParkingSession.user_id == user_id,
+                ParkingSession.plate_number == clean_plate,
+                ParkingSession.status == "EXITED",
+                ParkingSession.exit_time >= now_utc - timedelta(seconds=GATE_DEBOUNCE_SECONDS),
+            )
+            .first()
         )
-        db.add(blocked)
-        db.commit()
-        return {
-            "action": "LOCKED",
-            "access_type": "BLACKLIST",
-            "plate_number": clean_plate,
-            "message": f"ALERT: Blacklisted vehicle {clean_plate} at {gate_label}!",
-            "fee_inr": 0.0,
-        }
+        if recent_exit:
+            logger.info("[Gate:%s] Duplicate EXIT debounced for plate=%s", gate_label, clean_plate)
+            return {
+                "action": "OPENED",
+                "access_type": access_type,
+                "plate_number": clean_plate,
+                "message": f"EXIT ({gate_label}): {clean_plate} already cleared.",
+                "fee_inr": float(recent_exit.fee_inr or 0.0),
+            }
 
-    if lane_dir == "ENTRY":
         active = (
             db.query(ParkingSession)
             .filter(
@@ -195,106 +306,74 @@ def process_gate_decision(
                 ParkingSession.plate_number == clean_plate,
                 ParkingSession.status == "PARKED",
             )
+            .order_by(ParkingSession.entry_time.desc())
             .first()
         )
-        if active:
+
+        if not active:
+            exit_only = ParkingSession(
+                user_id=user_id,
+                plate_number=clean_plate,
+                vehicle_type=vehicle_type,
+                parking_type=parking_type,
+                access_type=access_type,
+                gate_action="OPENED",
+                exit_gate=gate_label,
+                entry_time=now_utc,
+                exit_time=now_utc,
+                duration_mins=0,
+                fee_inr=0.0,
+                status="EXITED",
+                exit_image=image_path,
+            )
+            db.add(exit_only)
+            db.commit()
+            logger.info("[Gate:%s] EXIT (no prior entry) plate=%s", gate_label, clean_plate)
             return {
                 "action": "OPENED",
                 "access_type": access_type,
                 "plate_number": clean_plate,
-                "message": f"{clean_plate} already inside (Session #{active.id}).",
+                "message": f"EXIT ({gate_label}): {clean_plate} cleared (₹0).",
                 "fee_inr": 0.0,
             }
 
-        sess = ParkingSession(
-            user_id=user_id,
-            plate_number=clean_plate,
-            vehicle_type=vehicle_type,
-            parking_type=parking_type,
-            access_type=access_type,
-            gate_action="OPENED",
-            entry_gate=gate_label,
-            entry_time=now_utc,
-            duration_mins=0,
-            fee_inr=0.0,
-            status="PARKED",
-            entry_image=image_path,
+        entry_dt = active.entry_time
+        if entry_dt.tzinfo is None:
+            entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+
+        elapsed_mins = max(1, int((now_utc - entry_dt).total_seconds() // 60))
+        fee_inr = calculate_dynamic_tariff(
+            db, user_id, active.vehicle_type, active.parking_type, access_type, elapsed_mins
         )
-        db.add(sess)
+
+        active.exit_gate = gate_label
+        active.exit_time = now_utc
+        active.duration_mins = elapsed_mins
+        active.fee_inr = fee_inr
+        active.status = "EXITED"
+        active.gate_action = "OPENED"
+        if image_path:
+            active.exit_image = image_path
         db.commit()
-        owner_tag = f" • {reg.owner_name}" if reg else ""
+
+        logger.info(
+            "[Gate:%s] EXIT cleared plate=%s duration=%dm fee=₹%.2f",
+            gate_label,
+            clean_plate,
+            elapsed_mins,
+            fee_inr,
+        )
         return {
             "action": "OPENED",
             "access_type": access_type,
             "plate_number": clean_plate,
-            "message": f"ENTRY ({gate_label}): {clean_plate} [{vehicle_type}]{owner_tag}",
-            "fee_inr": 0.0,
+            "message": f"EXIT ({gate_label}): {clean_plate} • {elapsed_mins}m • ₹{fee_inr:.0f}",
+            "fee_inr": fee_inr,
         }
-
-    # EXIT FLOW
-    active = (
-        db.query(ParkingSession)
-        .filter(
-            ParkingSession.user_id == user_id,
-            ParkingSession.plate_number == clean_plate,
-            ParkingSession.status == "PARKED",
-        )
-        .order_by(ParkingSession.entry_time.desc())
-        .first()
-    )
-
-    if not active:
-        exit_only = ParkingSession(
-            user_id=user_id,
-            plate_number=clean_plate,
-            vehicle_type=vehicle_type,
-            parking_type=parking_type,
-            access_type=access_type,
-            gate_action="OPENED",
-            exit_gate=gate_label,
-            entry_time=now_utc,
-            exit_time=now_utc,
-            duration_mins=0,
-            fee_inr=0.0,
-            status="EXITED",
-            exit_image=image_path,
-        )
-        db.add(exit_only)
-        db.commit()
-        return {
-            "action": "OPENED",
-            "access_type": access_type,
-            "plate_number": clean_plate,
-            "message": f"EXIT ({gate_label}): {clean_plate} cleared (₹0).",
-            "fee_inr": 0.0,
-        }
-
-    entry_dt = active.entry_time
-    if entry_dt.tzinfo is None:
-        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-
-    elapsed_mins = max(1, int((now_utc - entry_dt).total_seconds() // 60))
-    fee_inr = calculate_dynamic_tariff(
-        db, user_id, active.vehicle_type, active.parking_type, access_type, elapsed_mins
-    )
-
-    active.exit_gate = gate_label
-    active.exit_time = now_utc
-    active.duration_mins = elapsed_mins
-    active.fee_inr = fee_inr
-    active.status = "EXITED"
-    active.gate_action = "OPENED"
-    if image_path:
-        active.exit_image = image_path
-    db.commit()
-
-    return {
-        "action": "OPENED",
-        "access_type": access_type,
-        "plate_number": clean_plate,
-        "message": f"EXIT ({gate_label}): {clean_plate} • {elapsed_mins}m • ₹{fee_inr:.0f}",
-        "fee_inr": fee_inr,
-    }
+    except Exception as exc:
+        db.rollback()
+        logger.exception("[Gate:%s] DB failure processing plate=%s: %s", gate_label, clean_plate, exc)
+        raise HTTPException(status_code=500, detail=f"Gate decision DB error: {exc}")
 
 
 @router.post("/gate-event")
@@ -314,12 +393,11 @@ def trigger_gate_event(req: GateEventRequest, db: Session = Depends(get_db)):
 
 @router.get("/stats/today")
 def get_today_stats(user_id: int = Query(...), db: Session = Depends(get_db)):
-    now_utc = datetime.now(timezone.utc)
-    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = get_ist_day_start_utc()
 
     today_sessions = (
         db.query(ParkingSession)
-        .filter(ParkingSession.user_id == user_id, ParkingSession.entry_time >= today_start)
+        .filter(ParkingSession.user_id == user_id, ParkingSession.entry_time >= today_start_utc)
         .all()
     )
     all_parked = (
@@ -329,7 +407,10 @@ def get_today_stats(user_id: int = Query(...), db: Session = Depends(get_db)):
     )
 
     org = db.query(OrganizationConfig).filter(OrganizationConfig.user_id == user_id).first()
-    cap_data = json.loads(org.capacity_json) if org and org.capacity_json else {"slots": {}}
+    try:
+        cap_data = json.loads(org.capacity_json) if org and org.capacity_json else {"slots": {}}
+    except Exception:
+        cap_data = {"slots": {}}
     slots_map = cap_data.get("slots", {})
 
     total_slots_by_type = {"2W": 0, "4W": 0, "HCV": 0}
@@ -376,6 +457,8 @@ def get_recent_events(user_id: int = Query(...), db: Session = Depends(get_db)):
     events = []
     for r in rows:
         latest_ts = r.exit_time or r.entry_time
+        if latest_ts and latest_ts.tzinfo is None:
+            latest_ts = latest_ts.replace(tzinfo=timezone.utc)
         img = r.exit_image or r.entry_image
         events.append(
             {
@@ -387,7 +470,7 @@ def get_recent_events(user_id: int = Query(...), db: Session = Depends(get_db)):
                 "status": r.status,
                 "gate": r.exit_gate if r.status == "EXITED" else r.entry_gate,
                 "fee_inr": r.fee_inr,
-                "timestamp": latest_ts.isoformat() if latest_ts else None,
+                "timestamp": to_utc_iso(latest_ts),
                 "image_url": f"http://localhost:8000/{img.replace(chr(92), '/')}" if img else None,
             }
         )
@@ -407,8 +490,8 @@ def list_sessions(
     q = db.query(ParkingSession).filter(ParkingSession.user_id == user_id)
 
     if today_only:
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        q = q.filter(ParkingSession.entry_time >= today_start)
+        today_start_utc = get_ist_day_start_utc()
+        q = q.filter(ParkingSession.entry_time >= today_start_utc)
 
     if status and status != "ALL":
         q = q.filter(ParkingSession.status == status)
@@ -437,8 +520,8 @@ def list_sessions(
                 "gate_action": r.gate_action,
                 "entry_gate": r.entry_gate,
                 "exit_gate": r.exit_gate,
-                "entry_time": r.entry_time.isoformat() if r.entry_time else None,
-                "exit_time": r.exit_time.isoformat() if r.exit_time else None,
+                "entry_time": to_utc_iso(r.entry_time),
+                "exit_time": to_utc_iso(r.exit_time),
                 "duration_mins": r.duration_mins,
                 "fee_inr": r.fee_inr,
                 "status": r.status,
@@ -492,35 +575,40 @@ def register_vehicle(req: VehicleRegisterRequest, db: Session = Depends(get_db))
     if not clean_plate:
         raise HTTPException(status_code=400, detail="Valid license plate is required")
 
-    existing = (
-        db.query(RegisteredVehicle)
-        .filter(RegisteredVehicle.user_id == req.user_id, RegisteredVehicle.plate_number == clean_plate)
-        .first()
-    )
-    if existing:
-        existing.owner_name = req.owner_name.strip()
-        existing.phone_number = req.phone_number.strip()
-        existing.flat_or_unit = req.flat_or_unit.strip()
-        existing.vehicle_type = req.vehicle_type.upper()
-        existing.parking_type = req.parking_type.upper()
-        existing.access_status = req.access_status.upper()
-        existing.valid_until = req.valid_until
-    else:
-        existing = RegisteredVehicle(
-            user_id=req.user_id,
-            plate_number=clean_plate,
-            owner_name=req.owner_name.strip(),
-            phone_number=req.phone_number.strip(),
-            flat_or_unit=req.flat_or_unit.strip(),
-            vehicle_type=req.vehicle_type.upper(),
-            parking_type=req.parking_type.upper(),
-            access_status=req.access_status.upper(),
-            valid_until=req.valid_until,
+    try:
+        existing = (
+            db.query(RegisteredVehicle)
+            .filter(RegisteredVehicle.user_id == req.user_id, RegisteredVehicle.plate_number == clean_plate)
+            .first()
         )
-        db.add(existing)
+        if existing:
+            existing.owner_name = req.owner_name.strip()
+            existing.phone_number = req.phone_number.strip()
+            existing.flat_or_unit = req.flat_or_unit.strip()
+            existing.vehicle_type = req.vehicle_type.upper()
+            existing.parking_type = req.parking_type.upper()
+            existing.access_status = req.access_status.upper()
+            existing.valid_until = req.valid_until
+        else:
+            existing = RegisteredVehicle(
+                user_id=req.user_id,
+                plate_number=clean_plate,
+                owner_name=req.owner_name.strip(),
+                phone_number=req.phone_number.strip(),
+                flat_or_unit=req.flat_or_unit.strip(),
+                vehicle_type=req.vehicle_type.upper(),
+                parking_type=req.parking_type.upper(),
+                access_status=req.access_status.upper(),
+                valid_until=req.valid_until,
+            )
+            db.add(existing)
 
-    db.commit()
-    return {"status": "saved", "plate_number": clean_plate}
+        db.commit()
+        return {"status": "saved", "plate_number": clean_plate}
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to register vehicle %s: %s", clean_plate, exc)
+        raise HTTPException(status_code=500, detail=f"Failed to register vehicle: {exc}")
 
 
 @router.delete("/vehicles/{vehicle_id}")
@@ -557,37 +645,42 @@ def list_rates(user_id: int = Query(...), db: Session = Depends(get_db)):
 def save_rate(req: RateCreateRequest, db: Session = Depends(get_db)):
     vt = req.vehicle_type.upper()
     pt = req.parking_type.upper()
-    existing = (
-        db.query(RateConfig)
-        .filter(
-            RateConfig.user_id == req.user_id,
-            RateConfig.vehicle_type == vt,
-            RateConfig.parking_type == pt,
+    try:
+        existing = (
+            db.query(RateConfig)
+            .filter(
+                RateConfig.user_id == req.user_id,
+                RateConfig.vehicle_type == vt,
+                RateConfig.parking_type == pt,
+            )
+            .first()
         )
-        .first()
-    )
-    if existing:
-        existing.grace_period_mins = req.grace_period_mins
-        existing.base_hours = req.base_hours
-        existing.base_fee_inr = req.base_fee_inr
-        existing.extra_hourly_rate_inr = req.extra_hourly_rate_inr
-        existing.daily_max_cap_inr = req.daily_max_cap_inr
-        existing.is_free_for_whitelist = req.is_free_for_whitelist
-    else:
-        existing = RateConfig(
-            user_id=req.user_id,
-            vehicle_type=vt,
-            parking_type=pt,
-            grace_period_mins=req.grace_period_mins,
-            base_hours=req.base_hours,
-            base_fee_inr=req.base_fee_inr,
-            extra_hourly_rate_inr=req.extra_hourly_rate_inr,
-            daily_max_cap_inr=req.daily_max_cap_inr,
-            is_free_for_whitelist=req.is_free_for_whitelist,
-        )
-        db.add(existing)
-    db.commit()
-    return {"status": "saved"}
+        if existing:
+            existing.grace_period_mins = req.grace_period_mins
+            existing.base_hours = req.base_hours
+            existing.base_fee_inr = req.base_fee_inr
+            existing.extra_hourly_rate_inr = req.extra_hourly_rate_inr
+            existing.daily_max_cap_inr = req.daily_max_cap_inr
+            existing.is_free_for_whitelist = req.is_free_for_whitelist
+        else:
+            existing = RateConfig(
+                user_id=req.user_id,
+                vehicle_type=vt,
+                parking_type=pt,
+                grace_period_mins=req.grace_period_mins,
+                base_hours=req.base_hours,
+                base_fee_inr=req.base_fee_inr,
+                extra_hourly_rate_inr=req.extra_hourly_rate_inr,
+                daily_max_cap_inr=req.daily_max_cap_inr,
+                is_free_for_whitelist=req.is_free_for_whitelist,
+            )
+            db.add(existing)
+        db.commit()
+        return {"status": "saved"}
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to save rate config: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to save rate config: {exc}")
 
 
 @router.delete("/rates/{rate_id}")
@@ -621,16 +714,21 @@ def get_org_config(user_id: int = Query(...), db: Session = Depends(get_db)):
 
 @router.put("/org-config")
 def save_org_config(req: OrgConfigRequest, db: Session = Depends(get_db)):
-    org = db.query(OrganizationConfig).filter(OrganizationConfig.user_id == req.user_id).first()
-    if not org:
-        org = OrganizationConfig(user_id=req.user_id)
-        db.add(org)
+    try:
+        org = db.query(OrganizationConfig).filter(OrganizationConfig.user_id == req.user_id).first()
+        if not org:
+            org = OrganizationConfig(user_id=req.user_id)
+            db.add(org)
 
-    org.org_name = req.org_name.strip() or "Smart Parking Facility"
-    org.address = req.address.strip()
-    org.contact_phone = req.contact_phone.strip()
-    org.gst_number = req.gst_number.strip()
-    org.capacity_json = json.dumps(req.capacity_data)
-    org.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    return {"status": "saved"}
+        org.org_name = req.org_name.strip() or "Smart Parking Facility"
+        org.address = req.address.strip()
+        org.contact_phone = req.contact_phone.strip()
+        org.gst_number = req.gst_number.strip()
+        org.capacity_json = json.dumps(req.capacity_data)
+        org.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        return {"status": "saved"}
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to save org config: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to save organization config: {exc}")

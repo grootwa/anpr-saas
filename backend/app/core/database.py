@@ -156,6 +156,7 @@ class Camera(Base):
     line_x2 = Column(Float, default=0.85)
     line_y2 = Column(Float, default=0.65)
     is_active = Column(Boolean, default=False)
+    burst_frames = Column(Integer, default=1)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
 

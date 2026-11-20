@@ -1,3 +1,4 @@
+import logging
 import time
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
@@ -7,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.database import SessionLocal, Camera
 from app.services.stream_manager import stream_manager
 
+logger = logging.getLogger("anpr.streams")
 router = APIRouter()
 
 
@@ -29,6 +31,7 @@ class CameraCreateUpdateRequest(BaseModel):
     line_x2: float = 0.85
     line_y2: float = 0.65
     is_active: bool = True
+    burst_frames: int = 1
 
 
 class SlantLineRequest(BaseModel):
@@ -38,8 +41,13 @@ class SlantLineRequest(BaseModel):
     line_y2: float
 
 
+def _clamp_burst(val: int | None) -> int:
+    return max(1, min(10, int(val or 1)))
+
+
 def serialize_camera(cam: Camera) -> dict:
     worker = stream_manager.get_worker(cam.id)
+    burst = _clamp_burst(getattr(cam, "burst_frames", 1))
     return {
         "id": cam.id,
         "gate_no": cam.gate_no,
@@ -51,8 +59,10 @@ def serialize_camera(cam: Camera) -> dict:
         "line_x2": cam.line_x2,
         "line_y2": cam.line_y2,
         "is_active": bool(worker and worker.running),
+        "burst_frames": burst,
         "connected": bool(worker and worker.connected),
         "status_text": worker.status_text if worker else "Offline",
+        "last_error": worker.last_error if worker else None,
     }
 
 
@@ -64,21 +74,28 @@ def list_cameras(user_id: int = Query(...), db: Session = Depends(get_db)):
 
 @router.post("/create")
 def create_camera(req: CameraCreateUpdateRequest, db: Session = Depends(get_db)):
-    cam = Camera(
-        user_id=req.user_id,
-        gate_no=req.gate_no.strip(),
-        gate_name=req.gate_name.strip(),
-        source_url=req.source_url.strip(),
-        gate_type=req.gate_type.upper(),
-        line_x1=req.line_x1,
-        line_y1=req.line_y1,
-        line_x2=req.line_x2,
-        line_y2=req.line_y2,
-        is_active=req.is_active,
-    )
-    db.add(cam)
-    db.commit()
-    db.refresh(cam)
+    safe_burst = _clamp_burst(req.burst_frames)
+    try:
+        cam = Camera(
+            user_id=req.user_id,
+            gate_no=req.gate_no.strip(),
+            gate_name=req.gate_name.strip(),
+            source_url=req.source_url.strip(),
+            gate_type=req.gate_type.upper(),
+            line_x1=req.line_x1,
+            line_y1=req.line_y1,
+            line_x2=req.line_x2,
+            line_y2=req.line_y2,
+            is_active=req.is_active,
+            burst_frames=safe_burst,
+        )
+        db.add(cam)
+        db.commit()
+        db.refresh(cam)
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to create camera %s: %s", req.gate_no, exc)
+        raise HTTPException(status_code=500, detail=f"Database error creating camera: {exc}")
 
     if cam.is_active and cam.source_url:
         stream_manager.start_camera(cam)
@@ -92,18 +109,26 @@ def update_camera(camera_id: int, req: CameraCreateUpdateRequest, db: Session = 
     if not cam:
         raise HTTPException(status_code=404, detail="Camera not found")
 
+    safe_burst = _clamp_burst(req.burst_frames)
     source_changed = cam.source_url != req.source_url.strip()
-    cam.gate_no = req.gate_no.strip()
-    cam.gate_name = req.gate_name.strip()
-    cam.source_url = req.source_url.strip()
-    cam.gate_type = req.gate_type.upper()
-    cam.line_x1 = req.line_x1
-    cam.line_y1 = req.line_y1
-    cam.line_x2 = req.line_x2
-    cam.line_y2 = req.line_y2
-    cam.is_active = req.is_active
-    db.commit()
-    db.refresh(cam)
+
+    try:
+        cam.gate_no = req.gate_no.strip()
+        cam.gate_name = req.gate_name.strip()
+        cam.source_url = req.source_url.strip()
+        cam.gate_type = req.gate_type.upper()
+        cam.line_x1 = req.line_x1
+        cam.line_y1 = req.line_y1
+        cam.line_x2 = req.line_x2
+        cam.line_y2 = req.line_y2
+        cam.is_active = req.is_active
+        cam.burst_frames = safe_burst
+        db.commit()
+        db.refresh(cam)
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to update camera #%s: %s", camera_id, exc)
+        raise HTTPException(status_code=500, detail=f"Database error updating camera: {exc}")
 
     if cam.is_active and cam.source_url:
         worker = stream_manager.get_worker(cam.id)
@@ -115,6 +140,7 @@ def update_camera(camera_id: int, req: CameraCreateUpdateRequest, db: Session = 
                 cam.gate_name,
                 cam.gate_type,
                 (cam.line_x1, cam.line_y1, cam.line_x2, cam.line_y2),
+                burst_frames=cam.burst_frames,
             )
     else:
         stream_manager.stop_camera(cam.id)
@@ -178,7 +204,6 @@ def get_camera_latest_frame(camera_id: int):
     if not worker or not worker.running:
         raise HTTPException(status_code=404, detail="Camera stream offline")
 
-    # Signal worker that UI is actively viewing this camera
     worker.last_preview_request = time.time()
 
     with worker.lock:

@@ -1,14 +1,18 @@
+import logging
 import os
+import threading
 import time
 import uuid
-import threading
 from collections import defaultdict, deque
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 from app.core.config import settings
 from app.worker.tasks import process_anpr_pipeline
+
+logger = logging.getLogger("anpr.stream_manager")
 
 # Force TCP RTSP + 5s socket timeout (stimeout in microseconds) before any VideoCapture call
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
@@ -26,6 +30,9 @@ VEHICLE_CLASS_MAP = {
 # Global lock to serialize YOLO model instantiation safely across camera threads
 _MODEL_INIT_LOCK = threading.Lock()
 
+MAX_CELERY_QUEUE_DEPTH = 12
+DISPATCH_COOLDOWN_SEC = 2.0
+
 
 class CameraStreamWorker:
     def __init__(
@@ -37,6 +44,7 @@ class CameraStreamWorker:
         gate_type: str,
         source_url: str,
         line_coords: tuple[float, float, float, float] = (0.15, 0.65, 0.85, 0.65),
+        burst_frames: int = 3,
     ):
         self.camera_id = camera_id
         self.user_id = user_id
@@ -45,12 +53,18 @@ class CameraStreamWorker:
         self.gate_type = gate_type.upper()
         self.source_url = source_url.strip()
         self.line_coords = line_coords
+        self.burst_frames = max(1, min(10, int(burst_frames or 3)))
 
         self.running = False
         self.connected = False
         self.status_text = "Initializing..."
+        self.last_error: str | None = None
+        self.last_frame_ts: float = 0.0
+        self.dispatched_count: int = 0
+
         self.latest_jpeg: bytes | None = None
         self.last_preview_request: float = 0.0
+        self._last_dispatch_ts: float = 0.0
 
         # Latest raw frame buffer updated by dedicated grabber thread (prevents RTSP lag)
         self._raw_frame: np.ndarray | None = None
@@ -65,8 +79,13 @@ class CameraStreamWorker:
         if self.running:
             return
         self.running = True
-        self.grab_thread = threading.Thread(target=self._grab_loop, daemon=True)
-        self.infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
+        self.last_error = None
+        self.grab_thread = threading.Thread(
+            target=self._grab_loop, name=f"cam-{self.camera_id}-grab", daemon=True
+        )
+        self.infer_thread = threading.Thread(
+            target=self._infer_loop, name=f"cam-{self.camera_id}-infer", daemon=True
+        )
         self.grab_thread.start()
         self.infer_thread.start()
 
@@ -74,6 +93,10 @@ class CameraStreamWorker:
         self.running = False
         self.connected = False
         self.status_text = "Stopped"
+        if self.grab_thread and self.grab_thread.is_alive():
+            self.grab_thread.join(timeout=1.5)
+        if self.infer_thread and self.infer_thread.is_alive():
+            self.infer_thread.join(timeout=1.5)
 
     def update_config(
         self,
@@ -81,11 +104,14 @@ class CameraStreamWorker:
         gate_name: str,
         gate_type: str,
         line_coords: tuple[float, float, float, float],
+        burst_frames: int | None = None,
     ):
         self.gate_no = gate_no
         self.gate_name = gate_name
         self.gate_type = gate_type.upper()
         self.line_coords = line_coords
+        if burst_frames is not None:
+            self.burst_frames = max(1, min(10, int(burst_frames or 3)))
 
     def update_line(self, x1: float, y1: float, x2: float, y2: float):
         self.line_coords = (
@@ -133,13 +159,37 @@ class CameraStreamWorker:
         within = (-pad) <= t <= (1.0 + pad)
         return side, within
 
+    def _is_celery_overloaded(self) -> bool:
+        try:
+            import redis
+
+            r = redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=1)
+            depth = r.llen("celery")
+            if depth >= MAX_CELERY_QUEUE_DEPTH:
+                self.last_error = f"Celery queue backlog ({depth} pending)"
+                logger.warning("[Cam:%s] Skipping dispatch — Celery queue depth=%d", self.camera_id, depth)
+                return True
+        except Exception:
+            pass
+        return False
+
     def _dispatch_burst(self, track_id: int, frames: list, vehicle_type: str):
+        now = time.time()
+        if now - self._last_dispatch_ts < DISPATCH_COOLDOWN_SEC:
+            logger.debug("[Cam:%s] Dispatch cooldown active for track #%s", self.camera_id, track_id)
+            return
+
+        if self._is_celery_overloaded():
+            return
+
+        limit = self.burst_frames
         task_id = str(uuid.uuid4())
+        os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
         saved_paths = []
-        for idx, frame in enumerate(frames[:3]):
+        for idx, frame in enumerate(frames[:limit]):
             path = os.path.join(settings.UPLOAD_DIR, f"cam{self.camera_id}_{task_id}_f{idx}.jpg")
-            cv2.imwrite(path, frame)
-            saved_paths.append(path)
+            if cv2.imwrite(path, frame):
+                saved_paths.append(path)
 
         if saved_paths:
             gate_payload = {
@@ -155,8 +205,25 @@ class CameraStreamWorker:
                     "parking",
                     gate_payload,
                 )
+                self._last_dispatch_ts = now
+                self.dispatched_count += 1
+                self.last_error = None
+                logger.info(
+                    "[Cam:%s] Dispatched task=%s track=#%s type=%s frames=%d",
+                    self.camera_id,
+                    task_id,
+                    track_id,
+                    vehicle_type,
+                    len(saved_paths),
+                )
             except Exception as exc:
-                print(f"[StreamManager] Celery dispatch error on cam {self.camera_id}: {exc}")
+                self.last_error = f"Celery dispatch error: {exc}"
+                logger.exception("[Cam:%s] Celery dispatch error: %s", self.camera_id, exc)
+                for p in saved_paths:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
 
     def _grab_loop(self):
         """Dedicated wire-speed RTSP reader so decoder buffers never back up."""
@@ -165,43 +232,62 @@ class CameraStreamWorker:
         cap = self._open_capture(source)
 
         while self.running:
-            if not cap.isOpened():
-                self.connected = False
-                self.status_text = "Connecting..."
-                with self.lock:
-                    self.latest_jpeg = self._make_placeholder_jpeg(f"Connecting to {self.source_url}...")
-                time.sleep(2.0)
-                cap.release()
-                cap = self._open_capture(source)
-                continue
-
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                if is_local_file:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    time.sleep(0.03)
+            try:
+                if not cap.isOpened():
+                    self.connected = False
+                    self.status_text = "Connecting..."
+                    self.last_error = f"Unable to open stream: {self.source_url}"
+                    with self.lock:
+                        self.latest_jpeg = self._make_placeholder_jpeg(
+                            f"Connecting to {self.source_url}..."
+                        )
+                    time.sleep(2.5)
+                    cap.release()
+                    cap = self._open_capture(source)
                     continue
 
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    if is_local_file:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        time.sleep(0.03)
+                        continue
+
+                    self.connected = False
+                    self.status_text = "Reconnecting..."
+                    self.last_error = "RTSP read timeout / stream interrupted"
+                    logger.warning("[Cam:%s] Stream interrupted, reconnecting...", self.camera_id)
+                    with self.lock:
+                        self.latest_jpeg = self._make_placeholder_jpeg(
+                            "Stream interrupted. Reconnecting..."
+                        )
+                    cap.release()
+                    time.sleep(2.5)
+                    cap = self._open_capture(source)
+                    continue
+
+                self.connected = True
+                self.status_text = "LIVE"
+                self.last_frame_ts = time.time()
+                with self._frame_lock:
+                    self._raw_frame = frame
+                    self._raw_frame_seq += 1
+
+                if is_local_file:
+                    time.sleep(0.04)
+                else:
+                    time.sleep(0.005)
+            except Exception as grab_exc:
                 self.connected = False
-                self.status_text = "Reconnecting..."
-                with self.lock:
-                    self.latest_jpeg = self._make_placeholder_jpeg("Stream interrupted. Reconnecting...")
-                cap.release()
-                time.sleep(2.0)
+                self.status_text = "Stream Error"
+                self.last_error = str(grab_exc)
+                logger.exception("[Cam:%s] Grab loop exception: %s", self.camera_id, grab_exc)
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                time.sleep(3.0)
                 cap = self._open_capture(source)
-                continue
-
-            self.connected = True
-            self.status_text = "LIVE"
-            with self._frame_lock:
-                self._raw_frame = frame
-                self._raw_frame_seq += 1
-
-            # Pace local video files to ~25 FPS; live RTSP already paces via network arrival
-            if is_local_file:
-                time.sleep(0.04)
-            else:
-                time.sleep(0.005)
 
         cap.release()
 
@@ -210,13 +296,24 @@ class CameraStreamWorker:
         model_path = os.getenv("VEHICLE_TRACK_MODEL", "yolo11n.pt")
         vehicle_conf = float(os.getenv("VEHICLE_CONF", "0.60"))
 
-        with _MODEL_INIT_LOCK:
-            model = YOLO(model_path)
+        model = None
+        while self.running and model is None:
+            try:
+                with _MODEL_INIT_LOCK:
+                    model = YOLO(model_path)
+            except Exception as init_exc:
+                self.last_error = f"Tracker model load error: {init_exc}"
+                logger.exception("[Cam:%s] Failed to load YOLO tracker model: %s", self.camera_id, init_exc)
+                time.sleep(3.0)
+
+        if not self.running or model is None:
+            return
 
         prev_side: dict[int, float] = {}
         pre_cross_buffer: dict[int, deque] = defaultdict(lambda: deque(maxlen=2))
         triggered_ids: set[int] = set()
-        post_cross_collect: dict[int, tuple[str, list]] = {}
+        # track_id -> (vehicle_type, frames_list, cross_started_ts)
+        post_cross_collect: dict[int, tuple[str, list, float]] = {}
         last_seen_ts: dict[int, float] = {}
 
         last_processed_seq = -1
@@ -235,6 +332,7 @@ class CameraStreamWorker:
                 continue
 
             now = time.time()
+            target_burst = self.burst_frames
             orig_h, orig_w = full_frame.shape[:2]
             proc_w = 640
             scale = proc_w / float(orig_w) if orig_w > proc_w else 1.0
@@ -259,7 +357,8 @@ class CameraStreamWorker:
                     verbose=False,
                 )
             except Exception as exc:
-                print(f"[StreamManager] Tracking error on cam {self.camera_id}: {exc}")
+                self.last_error = f"ByteTrack inference error: {exc}"
+                logger.warning("[Cam:%s] Tracking error: %s", self.camera_id, exc)
                 time.sleep(0.05)
                 continue
 
@@ -282,15 +381,15 @@ class CameraStreamWorker:
                     bottom_cx = (x1 + x2) / 2.0
                     bottom_y = float(y2)
 
-                    if tid not in triggered_ids:
+                    if tid not in triggered_ids and target_burst > 1:
                         pre_cross_buffer[tid].append(full_frame.copy())
 
                     if tid in post_cross_collect:
-                        vt, frames_list = post_cross_collect[tid]
+                        vt, frames_list, cross_ts = post_cross_collect[tid]
                         frames_list.append(full_frame.copy())
-                        if len(frames_list) >= 3:
+                        if len(frames_list) >= target_burst:
                             post_cross_collect.pop(tid, None)
-                            self._dispatch_burst(tid, frames_list, vt)
+                            self._dispatch_burst(tid, frames_list[:target_burst], vt)
 
                     curr_side, within_seg = self._signed_side_and_within_segment(
                         bottom_cx, bottom_y, px1, py1, px2, py2
@@ -300,8 +399,16 @@ class CameraStreamWorker:
                         ps = prev_side[tid]
                         if (ps < 0 <= curr_side) or (ps > 0 >= curr_side):
                             triggered_ids.add(tid)
-                            seed = list(pre_cross_buffer.pop(tid, [])) or [full_frame.copy()]
-                            post_cross_collect[tid] = (v_type, seed)
+                            if target_burst == 1:
+                                pre_cross_buffer.pop(tid, None)
+                                self._dispatch_burst(tid, [full_frame.copy()], v_type)
+                            else:
+                                max_seed = min(2, target_burst - 1)
+                                seed = list(pre_cross_buffer.pop(tid, []))[-max_seed:] or [full_frame.copy()]
+                                if len(seed) >= target_burst:
+                                    self._dispatch_burst(tid, seed[:target_burst], v_type)
+                                else:
+                                    post_cross_collect[tid] = (v_type, seed, now)
 
                     prev_side[tid] = curr_side
 
@@ -318,6 +425,13 @@ class CameraStreamWorker:
                             box_color,
                             1,
                         )
+
+            # Flush any partial post-cross burst if vehicle exited frame within 0.6s
+            for tid in list(post_cross_collect.keys()):
+                vt, frames_list, cross_ts = post_cross_collect[tid]
+                if now - cross_ts >= 0.6:
+                    post_cross_collect.pop(tid, None)
+                    self._dispatch_burst(tid, frames_list[:target_burst], vt)
 
             if render_preview:
                 ok, buf = cv2.imencode(".jpg", proc_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
@@ -355,6 +469,7 @@ class StreamManager:
             gate_type=cam.gate_type,
             source_url=cam.source_url,
             line_coords=(cam.line_x1, cam.line_y1, cam.line_x2, cam.line_y2),
+            burst_frames=getattr(cam, "burst_frames", 1) or 1,
         )
         self.workers[cam.id] = worker
         worker.start()
