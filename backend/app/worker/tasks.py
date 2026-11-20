@@ -291,7 +291,13 @@ def get_all_candidates_from_blocks(blocks):
 
 # MAIN CELERY WORKER TASK
 @celery.task(name="process_anpr_pipeline")
-def process_anpr_pipeline(task_id: str, file_paths: list, user_id: int, app_source: str = "snapshot"):
+def process_anpr_pipeline(
+    task_id: str,
+    file_paths: list,
+    user_id: int,
+    app_source: str = "snapshot",
+    gate_direction: str | None = None,
+):
     print(f"\n[Worker] 📥 Picked up task {task_id} | Analyzing {len(file_paths)} frames for User {user_id}")
     
     master_candidate_pool = []
@@ -372,25 +378,35 @@ def process_anpr_pipeline(task_id: str, file_paths: list, user_id: int, app_sour
         
         print(f"[Worker] ✅ Result: {plate_text} ({category}) | Seen in {plate_groups[plate_text]['count']} passes")
 
-    # 3. SAVE TO MYSQL DATABASE
+    # 3. SAVE TO MYSQL DATABASE & TRIGGER GATE IF STREAM-DRIVEN
     db = SessionLocal()
     try:
+        primary_image = file_paths[0] if file_paths else ""
         new_log = ANPRLog(
             user_id=user_id,
             app_source=app_source,
             task_id=task_id,
-            image_path=file_paths[0] if file_paths else "",
+            image_path=primary_image,
             plate_number=plate_text,
             category=category,
             confidence=confidence_val,
-            status=db_status
+            status=db_status,
         )
         db.add(new_log)
         db.commit()
-        print(f"[Worker] 💾 Saved {plate_text} ({app_source}) to MySQL database for User {user_id}")
+
+        if gate_direction in ("ENTRY", "EXIT"):
+            from app.api.parking import process_gate_decision
+            process_gate_decision(
+                db=db,
+                user_id=user_id,
+                plate_number=plate_text,
+                direction=gate_direction,
+                image_path=primary_image,
+            )
     except Exception as e:
         db.rollback()
-        print(f"[Worker] ❌ Database Error: {e}")
+        print(f"[Worker] Database Error: {e}")
     finally:
         db.close()
 
