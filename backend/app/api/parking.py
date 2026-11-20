@@ -626,7 +626,7 @@ def save_org_config(req: OrgConfigRequest, db: Session = Depends(get_db)):
         org = OrganizationConfig(user_id=req.user_id)
         db.add(org)
 
-    org.org_name = req.org_name.strip()
+    org.org_name = req.org_name.strip() or "Smart Parking Facility"
     org.address = req.address.strip()
     org.contact_phone = req.contact_phone.strip()
     org.gst_number = req.gst_number.strip()

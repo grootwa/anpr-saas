@@ -1,11 +1,8 @@
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import {
   ArrowLeft,
   ShieldCheck,
   ShieldAlert,
-  Car,
-  LogIn,
-  LogOut,
   IndianRupee,
   Clock,
   Plus,
@@ -15,14 +12,21 @@ import {
   AlertCircle,
   Search,
   Maximize2,
+  Bell,
+  X,
+  Building2,
+  Tags,
+  Users,
   Video,
-  Square,
-  Play
+  LayoutDashboard,
+  FileSpreadsheet,
+  Download
 } from "lucide-react"
 import type { UserSession } from "../App"
 import IndianPlateBadge from "../components/IndianPlateBadge"
 import ImageLightbox from "../components/ImageLightbox"
 import PaginationBar from "../components/PaginationBar"
+import CameraManagerSection from "../components/CameraManagerSection"
 
 interface ParkingAppProps {
   user: UserSession
@@ -32,247 +36,402 @@ interface ParkingAppProps {
 interface ParkingSessionItem {
   id: number
   plate_number: string
+  vehicle_type: string
+  parking_type: string
   access_type: "WHITELIST" | "VISITOR" | "BLACKLIST"
   gate_action: "OPENED" | "LOCKED"
+  entry_gate: string | null
+  exit_gate: string | null
   entry_time: string
   exit_time: string | null
   duration_mins: number
   fee_inr: number
   status: "PARKED" | "EXITED" | "BLOCKED"
+  entry_image_url: string | null
+  exit_image_url: string | null
+}
+
+interface RecentGateEvent {
+  event_key: string
+  session_id: number
+  plate_number: string
+  vehicle_type: string
+  access_type: string
+  status: "PARKED" | "EXITED" | "BLOCKED"
+  gate: string | null
+  fee_inr: number
+  timestamp: string | null
   image_url: string | null
 }
 
-interface VehicleRuleItem {
-  id: number
-  plate_number: string
-  rule_type: "WHITELIST" | "BLACKLIST"
-  owner_label: string
+interface StackedGatePopup extends RecentGateEvent {
+  popup_id: string
+  display_time: string
 }
 
-interface LaneState {
-  lane: "ENTRY" | "EXIT"
-  source_url: string
-  line_y_ratio: number
-  is_running: boolean
-  connected: boolean
-  status_text: string
+interface OrgConfigState {
+  org_name: string
+  address: string
+  contact_phone: string
+  gst_number: string
+  parking_types: string[]
+  slots: Record<string, Record<string, number>>
 }
 
 const API_BASE = "http://localhost:8000"
 
+const DEFAULT_ORG_CONFIG: OrgConfigState = {
+  org_name: "Smart Parking Facility",
+  address: "",
+  contact_phone: "",
+  gst_number: "",
+  parking_types: ["VISITOR", "RESIDENT", "VIP", "EV"],
+  slots: {
+    "2W": { VISITOR: 40, RESIDENT: 30, VIP: 10, EV: 10 },
+    "4W": { VISITOR: 50, RESIDENT: 40, VIP: 15, EV: 10 },
+    HCV: { VISITOR: 10, RESIDENT: 5, VIP: 2, EV: 0 },
+  },
+}
+
+type SubTabKey = "dashboard" | "reports" | "cameras" | "vehicles" | "rates" | "org"
+
 export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps) {
-  const [subTab, setSubTab] = useState<"gate" | "sessions" | "rules">(() => {
-    const saved = localStorage.getItem("anpr_parking_subtab")
-    if (saved === "gate" || saved === "sessions" || saved === "rules") {
-      return saved
-    }
-    return "gate"
+  const [subTab, setSubTab] = useState<SubTabKey>(() => {
+    const saved = localStorage.getItem("anpr_parking_subtab") as SubTabKey
+    return ["dashboard", "reports", "cameras", "vehicles", "rates", "org"].includes(saved)
+      ? saved
+      : "dashboard"
   })
 
   useEffect(() => {
     localStorage.setItem("anpr_parking_subtab", subTab)
   }, [subTab])
 
-  // Dual Live Stream State (ENTRY & EXIT)
-  const [lanes, setLanes] = useState<Record<"ENTRY" | "EXIT", LaneState>>({
-    ENTRY: {
-      lane: "ENTRY",
-      source_url: "",
-      line_y_ratio: 0.65,
-      is_running: false,
-      connected: false,
-      status_text: "Offline",
-    },
-    EXIT: {
-      lane: "EXIT",
-      source_url: "",
-      line_y_ratio: 0.65,
-      is_running: false,
-      connected: false,
-      status_text: "Offline",
-    },
-  })
-  const [streamNonce, setStreamNonce] = useState(Date.now())
-
-  // Manual Override Bar for Unreadable Plates
-  const [overridePlate, setOverridePlate] = useState("")
-  const [overrideDir, setOverrideDir] = useState<"ENTRY" | "EXIT">("ENTRY")
   const [toast, setToast] = useState<{ type: "success" | "error"; text: string } | null>(null)
 
-  // Persistent Sessions & Server-Side Pagination State
+  // Top-right LIFO stack of up to 5 live vehicle alerts (3s lifespan each)
+  const [eventPopups, setEventPopups] = useState<StackedGatePopup[]>([])
+  const seenEventKeysRef = useRef<Set<string>>(new Set())
+  const initialPollDoneRef = useRef(false)
+
+  const [lightboxData, setLightboxData] = useState<{ url: string | null; plate?: string }>({ url: null })
+
+  // Today's KPI Stats (Current Day)
+  const [todayStats, setTodayStats] = useState({
+    today_entries: 0,
+    today_exits: 0,
+    today_alerts: 0,
+    today_revenue: 0,
+    currently_parked: 0,
+    occupancy: {
+      "2W": { occupied: 0, total: 0, available: 0 },
+      "4W": { occupied: 0, total: 0, available: 0 },
+      HCV: { occupied: 0, total: 0, available: 0 },
+    },
+  })
+
+  // Sessions State (Today on Dashboard; Paginated All-Time on Reports)
   const [sessions, setSessions] = useState<ParkingSessionItem[]>([])
-  const [sessionSearch, setSessionSearch] = useState("")
-  const [sessionStatusFilter, setSessionStatusFilter] = useState<"ALL" | "PARKED" | "EXITED" | "BLOCKED">("ALL")
+  const [searchQuery, setSearchQuery] = useState("")
+  const [statusFilter, setStatusFilter] = useState<"ALL" | "PARKED" | "EXITED" | "BLOCKED">("ALL")
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(15)
   const [totalItems, setTotalItems] = useState(0)
   const [totalPages, setTotalPages] = useState(1)
+  const [loading, setLoading] = useState(false)
 
-  // Access Control Rules
-  const [rules, setRules] = useState<VehicleRuleItem[]>([])
-  const [newPlate, setNewPlate] = useState("")
-  const [newRuleType, setNewRuleType] = useState<"WHITELIST" | "BLACKLIST">("WHITELIST")
-  const [newLabel, setNewLabel] = useState("")
-  const [loadingData, setLoadingData] = useState(false)
-  const [lightboxItem, setLightboxItem] = useState<ParkingSessionItem | null>(null)
+  // Vehicle & Owner Registry State
+  const [vehicles, setVehicles] = useState<any[]>([])
+  const [vehSearch, setVehSearch] = useState("")
+  const [vForm, setVForm] = useState({
+    plate_number: "",
+    owner_name: "",
+    phone_number: "",
+    flat_or_unit: "",
+    vehicle_type: "4W",
+    parking_type: "RESIDENT",
+    access_status: "WHITELIST",
+    valid_until: "",
+  })
 
-  const showToast = (type: "success" | "error", text: string) => {
+  // Rate Configurator State
+  const [rates, setRates] = useState<any[]>([])
+  const [rForm, setRForm] = useState({
+    vehicle_type: "4W",
+    parking_type: "VISITOR",
+    grace_period_mins: 15,
+    base_hours: 1,
+    base_fee_inr: 20,
+    extra_hourly_rate_inr: 10,
+    daily_max_cap_inr: 200,
+    is_free_for_whitelist: true,
+  })
+
+  // Organization & Capacity State (hydrated immediately from localStorage, then synced with backend)
+  const orgStorageKey = `anpr_org_config_${user.id}`
+  const [orgForm, setOrgForm] = useState<OrgConfigState>(() => {
+    try {
+      const cached = localStorage.getItem(orgStorageKey)
+      if (cached) {
+        const parsed = JSON.parse(cached)
+        return {
+          ...DEFAULT_ORG_CONFIG,
+          ...parsed,
+          slots: parsed.slots || DEFAULT_ORG_CONFIG.slots,
+        }
+      }
+    } catch {
+      // Fallback to default
+    }
+    return DEFAULT_ORG_CONFIG
+  })
+  const [newParkingType, setNewParkingType] = useState("")
+
+  const showToast = useCallback((type: "success" | "error", text: string) => {
     setToast({ type, text })
     setTimeout(() => setToast(null), 3500)
-  }
+  }, [])
 
-  const fetchStreamConfigs = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/v1/stream/config?user_id=${user.id}`)
-      if (res.ok) setLanes(await res.json())
-    } catch {
-      // Ignore transient network errors during reload
+  const pushGatePopup = useCallback((ev: RecentGateEvent) => {
+    const popupId = `${ev.event_key}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    const displayTime = ev.timestamp
+      ? new Date(ev.timestamp).toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })
+      : new Date().toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })
+
+    const card: StackedGatePopup = {
+      ...ev,
+      popup_id: popupId,
+      display_time: displayTime,
     }
+
+    // LIFO stack: newest at top (index 0); if > 5, evict oldest from bottom
+    setEventPopups((prev) => [card, ...prev].slice(0, 5))
+
+    // Each card lives for 3 seconds independently
+    window.setTimeout(() => {
+      setEventPopups((prev) => prev.filter((item) => item.popup_id !== popupId))
+    }, 3000)
+  }, [])
+
+  const fetchTodayStats = useCallback(async () => {
+    const res = await fetch(`${API_BASE}/v1/parking/stats/today?user_id=${user.id}`)
+    if (res.ok) setTodayStats(await res.json())
   }, [user.id])
 
-  const fetchParkingData = useCallback(async () => {
-    setLoadingData(true)
+  const fetchSessions = useCallback(async () => {
+    setLoading(true)
     try {
       const params = new URLSearchParams({
         user_id: String(user.id),
-        page: String(page),
-        page_size: String(pageSize),
+        page: String(subTab === "dashboard" ? 1 : page),
+        page_size: String(subTab === "dashboard" ? 20 : pageSize),
+        today_only: subTab === "dashboard" ? "true" : "false",
       })
-      if (sessionSearch.trim()) params.append("search", sessionSearch.trim())
-      if (sessionStatusFilter !== "ALL") params.append("status", sessionStatusFilter)
+      if (searchQuery.trim()) params.append("search", searchQuery.trim())
+      if (statusFilter !== "ALL") params.append("status", statusFilter)
 
-      const [sessRes, rulesRes] = await Promise.all([
-        fetch(`${API_BASE}/v1/parking/sessions?${params.toString()}`),
-        fetch(`${API_BASE}/v1/parking/rules?user_id=${user.id}`),
-      ])
-
-      if (sessRes.ok) {
-        const data = await sessRes.json()
+      const res = await fetch(`${API_BASE}/v1/parking/sessions?${params.toString()}`)
+      if (res.ok) {
+        const data = await res.json()
         setSessions(data.items || [])
         setTotalItems(data.total || 0)
         setTotalPages(data.total_pages || 1)
       }
-      if (rulesRes.ok) {
-        setRules(await rulesRes.json())
-      }
-    } catch {
-      showToast("error", "Failed to sync gate records.")
     } finally {
-      setLoadingData(false)
+      setLoading(false)
     }
-  }, [user.id, page, pageSize, sessionSearch, sessionStatusFilter])
+  }, [user.id, subTab, page, pageSize, searchQuery, statusFilter])
 
-  useEffect(() => {
-    fetchStreamConfigs()
-    fetchParkingData()
-  }, [fetchStreamConfigs, fetchParkingData])
+  const fetchVehicles = useCallback(async () => {
+    const params = new URLSearchParams({ user_id: String(user.id) })
+    if (vehSearch.trim()) params.append("search", vehSearch.trim())
+    const res = await fetch(`${API_BASE}/v1/parking/vehicles?${params.toString()}`)
+    if (res.ok) setVehicles(await res.json())
+  }, [user.id, vehSearch])
 
-  // Auto-poll sessions every 2.5s whenever ENTRY or EXIT camera stream is active
-  useEffect(() => {
-    if (!lanes.ENTRY.is_running && !lanes.EXIT.is_running) return
-    const timer = setInterval(() => {
-      fetchParkingData()
-    }, 2500)
-    return () => clearInterval(timer)
-  }, [lanes.ENTRY.is_running, lanes.EXIT.is_running, fetchParkingData])
+  const fetchRates = useCallback(async () => {
+    const res = await fetch(`${API_BASE}/v1/parking/rates?user_id=${user.id}`)
+    if (res.ok) setRates(await res.json())
+  }, [user.id])
 
-  const handleStartLane = async (lane: "ENTRY" | "EXIT") => {
-    const cfg = lanes[lane]
-    if (!cfg.source_url.trim()) {
-      showToast("error", `Enter an RTSP URL, video path, or webcam index (0/1) for ${lane}.`)
-      return
-    }
-    const res = await fetch(`${API_BASE}/v1/stream/configure`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        user_id: user.id,
-        lane,
-        source_url: cfg.source_url,
-        line_y_ratio: cfg.line_y_ratio,
-        start_now: true,
-      }),
-    })
-    if (res.ok) {
-      setStreamNonce(Date.now())
-      await fetchStreamConfigs()
-      showToast("success", `${lane} stream started`)
-    }
-  }
-
-  const handleStopLane = async (lane: "ENTRY" | "EXIT") => {
-    await fetch(`${API_BASE}/v1/stream/stop?user_id=${user.id}&lane=${lane}`, { method: "POST" })
-    await fetchStreamConfigs()
-    showToast("success", `${lane} stream stopped`)
-  }
-
-  const handleLineSlider = async (lane: "ENTRY" | "EXIT", newRatio: number) => {
-    setLanes((prev) => ({
-      ...prev,
-      [lane]: { ...prev[lane], line_y_ratio: newRatio },
-    }))
-    await fetch(`${API_BASE}/v1/stream/line`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        user_id: user.id,
-        lane,
-        line_y_ratio: newRatio,
-      }),
-    })
-  }
-
-  const handleManualOverride = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!overridePlate.trim()) return
-    const res = await fetch(`${API_BASE}/v1/parking/gate-event`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        user_id: user.id,
-        plate_number: overridePlate,
-        direction: overrideDir,
-      }),
-    })
-    if (res.ok) {
+  const fetchOrgConfig = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/v1/parking/org-config?user_id=${user.id}`)
+      if (!res.ok) return
       const data = await res.json()
-      showToast(data.action === "LOCKED" ? "error" : "success", data.message)
-      setOverridePlate("")
-      fetchParkingData()
+      const nextOrg: OrgConfigState = {
+        org_name: data.org_name || DEFAULT_ORG_CONFIG.org_name,
+        address: data.address || "",
+        contact_phone: data.contact_phone || "",
+        gst_number: data.gst_number || "",
+        parking_types: data.capacity_data?.parking_types || DEFAULT_ORG_CONFIG.parking_types,
+        slots: data.capacity_data?.slots || DEFAULT_ORG_CONFIG.slots,
+      }
+      setOrgForm(nextOrg)
+      localStorage.setItem(orgStorageKey, JSON.stringify(nextOrg))
+    } catch {
+      // Keep cached org config if offline
+    }
+  }, [user.id, orgStorageKey])
+
+  // Always hydrate global organization config on mount so header stays persistent across refreshes
+  useEffect(() => {
+    fetchOrgConfig()
+  }, [fetchOrgConfig])
+
+  useEffect(() => {
+    fetchTodayStats()
+    if (subTab === "dashboard" || subTab === "reports") fetchSessions()
+    if (subTab === "vehicles") fetchVehicles()
+    if (subTab === "rates") fetchRates()
+    if (subTab === "org") fetchOrgConfig()
+  }, [subTab, fetchTodayStats, fetchSessions, fetchVehicles, fetchRates, fetchOrgConfig])
+
+  // Lightweight Event Notification Poller (pushes up to 5 stacked LIFO cards)
+  useEffect(() => {
+    let active = true
+    const pollEvents = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/v1/parking/events/recent?user_id=${user.id}`)
+        if (!res.ok || !active) return
+        const list: RecentGateEvent[] = await res.json()
+
+        // Seed existing keys on initial mount without flooding historical alerts
+        if (!initialPollDoneRef.current) {
+          list.forEach((ev) => seenEventKeysRef.current.add(ev.event_key))
+          initialPollDoneRef.current = true
+          return
+        }
+
+        // Process oldest-to-newest among unseen events so the latest lands at the top of the stack
+        const freshEvents = [...list].reverse().filter((ev) => {
+          if (seenEventKeysRef.current.has(ev.event_key)) return false
+          seenEventKeysRef.current.add(ev.event_key)
+          return true
+        })
+
+        if (freshEvents.length > 0) {
+          freshEvents.forEach((ev) => pushGatePopup(ev))
+          fetchTodayStats()
+          if (subTab === "dashboard") fetchSessions()
+        }
+      } catch {
+        // Ignore transient errors
+      }
+    }
+
+    pollEvents()
+    const interval = window.setInterval(pollEvents, 2000)
+    return () => {
+      active = false
+      window.clearInterval(interval)
+    }
+  }, [user.id, subTab, pushGatePopup, fetchTodayStats, fetchSessions])
+
+  const handleRegisterVehicle = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const res = await fetch(`${API_BASE}/v1/parking/vehicles`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: user.id, ...vForm }),
+    })
+    if (res.ok) {
+      showToast("success", `Registered ${vForm.plate_number.toUpperCase()}`)
+      setVForm({
+        plate_number: "",
+        owner_name: "",
+        phone_number: "",
+        flat_or_unit: "",
+        vehicle_type: "4W",
+        parking_type: "RESIDENT",
+        access_status: "WHITELIST",
+        valid_until: "",
+      })
+      fetchVehicles()
     }
   }
 
-  const handleAddRule = async (e: React.FormEvent) => {
+  const handleSaveRate = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!newPlate.trim()) return
-    await fetch(`${API_BASE}/v1/parking/rules`, {
+    const res = await fetch(`${API_BASE}/v1/parking/rates`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: user.id, ...rForm }),
+    })
+    if (res.ok) {
+      showToast("success", `Saved tariff rule for ${rForm.vehicle_type} (${rForm.parking_type})`)
+      fetchRates()
+    }
+  }
+
+  const handleSaveOrg = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const cleanOrgName = orgForm.org_name.trim() || DEFAULT_ORG_CONFIG.org_name
+    const nextOrg: OrgConfigState = {
+      ...orgForm,
+      org_name: cleanOrgName,
+    }
+
+    const res = await fetch(`${API_BASE}/v1/parking/org-config`, {
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         user_id: user.id,
-        plate_number: newPlate,
-        rule_type: newRuleType,
-        owner_label: newLabel,
+        org_name: nextOrg.org_name,
+        address: nextOrg.address,
+        contact_phone: nextOrg.contact_phone,
+        gst_number: nextOrg.gst_number,
+        capacity_data: {
+          parking_types: nextOrg.parking_types,
+          slots: nextOrg.slots,
+        },
       }),
     })
-    showToast("success", `Saved ${newPlate.toUpperCase()} to ${newRuleType}`)
-    setNewPlate("")
-    setNewLabel("")
-    fetchParkingData()
+    if (res.ok) {
+      setOrgForm(nextOrg)
+      localStorage.setItem(orgStorageKey, JSON.stringify(nextOrg))
+      showToast("success", "Organization & slot capacity saved globally")
+      fetchTodayStats()
+    } else {
+      showToast("error", "Failed to save organization details")
+    }
   }
 
-  const handleDeleteRule = async (ruleId: number) => {
-    await fetch(`${API_BASE}/v1/parking/rules/${ruleId}`, { method: "DELETE" })
-    showToast("success", "Rule removed")
-    fetchParkingData()
+  const exportCSV = () => {
+    const headers = ["ID", "Plate", "Type", "Access", "Entry Gate", "Entry Time", "Exit Gate", "Exit Time", "Duration (m)", "Fee (INR)", "Status"]
+    const rows = sessions.map((s) => [
+      s.id,
+      s.plate_number,
+      s.vehicle_type,
+      s.access_type,
+      s.entry_gate || "",
+      s.entry_time || "",
+      s.exit_gate || "",
+      s.exit_time || "",
+      s.duration_mins,
+      s.fee_inr,
+      s.status,
+    ])
+    const csv = "data:text/csv;charset=utf-8," + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n")
+    const link = document.createElement("a")
+    link.setAttribute("href", encodeURI(csv))
+    link.setAttribute("download", `parking_report_${new Date().toISOString().slice(0, 10)}.csv`)
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
   }
-
-  const activeParkedCount = sessions.filter((s) => s.status === "PARKED").length
-  const blockedCount = sessions.filter((s) => s.status === "BLOCKED").length
-  const totalRevenue = sessions.reduce((acc, s) => acc + (s.fee_inr || 0), 0)
 
   return (
     <div className="min-h-screen w-screen bg-slate-950 text-slate-100 flex flex-col">
+      {/* STANDARD TOAST */}
       {toast && (
         <div
           className={`fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-xl border text-xs font-semibold shadow-xl flex items-center space-x-2 ${
@@ -281,291 +440,286 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
               : "bg-rose-950/90 border-rose-500/50 text-rose-200"
           }`}
         >
-          {toast.type === "success" ? (
-            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-          ) : (
-            <AlertCircle className="w-4 h-4 text-rose-400" />
-          )}
+          {toast.type === "success" ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <AlertCircle className="w-4 h-4 text-rose-400" />}
           <span>{toast.text}</span>
         </div>
       )}
 
+      {/* TOP-RIGHT 5-CARD LIFO REAL-TIME GATE EVENT NOTIFICATION STACK (3s LIFESPAN EACH) */}
+      {eventPopups.length > 0 && (
+        <div className="fixed top-20 right-6 z-50 w-80 flex flex-col gap-2.5 pointer-events-none">
+          {eventPopups.map((item, idx) => (
+            <div
+              key={item.popup_id}
+              onClick={() => item.image_url && setLightboxData({ url: item.image_url, plate: item.plate_number })}
+              style={{ opacity: Math.max(0.82, 1 - idx * 0.04) }}
+              className={`pointer-events-auto rounded-2xl border p-3.5 shadow-2xl cursor-pointer transition-all duration-200 backdrop-blur-md ${
+                item.status === "BLOCKED"
+                  ? "bg-rose-950/95 border-rose-500 text-rose-100"
+                  : item.status === "EXITED"
+                  ? "bg-amber-950/95 border-amber-500/70 text-amber-100"
+                  : "bg-emerald-950/95 border-emerald-500/70 text-emerald-100"
+              }`}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider">
+                  <Bell className="w-3.5 h-3.5 animate-bounce shrink-0" />
+                  <span>
+                    {item.status === "BLOCKED"
+                      ? "Security Alert"
+                      : item.status === "EXITED"
+                      ? "Vehicle Exit Cleared"
+                      : "Vehicle Entry Recorded"}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <span className="text-[10px] font-mono opacity-75">{item.display_time}</span>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setEventPopups((prev) => prev.filter((p) => p.popup_id !== item.popup_id))
+                    }}
+                    className="text-slate-300 hover:text-white"
+                    aria-label="Dismiss alert"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-2 flex items-center justify-between gap-3">
+                <div className="space-y-1 min-w-0">
+                  <IndianPlateBadge plate={item.plate_number} size="sm" />
+                  <p className="text-[11px] opacity-90 truncate">
+                    Gate: <strong>{item.gate || "-"}</strong> • {item.vehicle_type}
+                  </p>
+                  {item.status === "EXITED" && (
+                    <p className="text-xs font-bold text-amber-300">Tariff: ₹{item.fee_inr.toFixed(0)}</p>
+                  )}
+                </div>
+                {item.image_url && (
+                  <img
+                    src={item.image_url}
+                    alt={item.plate_number}
+                    className="w-16 h-12 object-cover rounded-lg border border-white/20 shrink-0"
+                  />
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <ImageLightbox
-        imageUrl={lightboxItem?.image_url || null}
-        plateNumber={lightboxItem?.plate_number}
-        onClose={() => setLightboxItem(null)}
+        imageUrl={lightboxData.url}
+        plateNumber={lightboxData.plate}
+        onClose={() => setLightboxData({ url: null })}
       />
 
-      {/* TOP BAR */}
-      <header className="h-16 bg-slate-900 border-b border-slate-800 px-8 flex items-center justify-between">
-        <div className="flex items-center space-x-4">
+      {/* TOP HEADER */}
+      <header className="h-16 bg-slate-900 border-b border-slate-800 px-6 flex items-center justify-between gap-4">
+        <div className="flex items-center space-x-3 shrink-0">
           <button
             onClick={onBackToApps}
             className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 border border-slate-700"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
-            <span>All Apps</span>
+            <span>Apps</span>
           </button>
-          <div className="flex items-center space-x-2.5">
+          <div className="flex items-center space-x-2">
             <div className="p-2 bg-emerald-600/20 text-emerald-400 rounded-lg border border-emerald-500/30">
               <ShieldCheck className="w-4 h-4" />
             </div>
             <div>
-              <h1 className="text-sm font-bold text-white">Smart Parking & Access Control</h1>
-              <p className="text-[11px] text-slate-400">Dual-Lane Live Tripwire ANPR & Barrier Engine</p>
+              <h1 className="text-sm font-bold text-white">{orgForm.org_name}</h1>
+              <p className="text-[11px] text-slate-400">
+                {orgForm.address ? orgForm.address : "ANPR Parking & Gate Operations"}
+              </p>
             </div>
           </div>
         </div>
 
-        {/* SUB-NAVIGATION TABS */}
-        <div className="flex items-center space-x-2 bg-slate-950 p-1 rounded-lg border border-slate-800">
-          <button
-            onClick={() => setSubTab("gate")}
-            className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
-              subTab === "gate" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
-            }`}
-          >
-            Live Gate Feeds
-          </button>
-          <button
-            onClick={() => setSubTab("sessions")}
-            className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
-              subTab === "sessions" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
-            }`}
-          >
-            Parking Sessions ({totalItems})
-          </button>
-          <button
-            onClick={() => setSubTab("rules")}
-            className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
-              subTab === "rules" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
-            }`}
-          >
-            Whitelist & Watchlist ({rules.length})
-          </button>
-        </div>
+        {/* NAVIGATION TABS */}
+        <nav className="flex items-center space-x-1 bg-slate-950 p-1 rounded-xl border border-slate-800 overflow-x-auto">
+          {[
+            { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+            { key: "reports", label: "Audit Logs", icon: FileSpreadsheet },
+            { key: "cameras", label: "Cameras", icon: Video },
+            { key: "vehicles", label: "Vehicles & Owners", icon: Users },
+            { key: "rates", label: "Rate Configurator", icon: Tags },
+            { key: "org", label: "Organization & Slots", icon: Building2 },
+          ].map((t) => {
+            const Icon = t.icon
+            return (
+              <button
+                key={t.key}
+                onClick={() => {
+                  setSubTab(t.key as SubTabKey)
+                  setPage(1)
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
+                  subTab === t.key ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                <span>{t.label}</span>
+              </button>
+            )
+          })}
+        </nav>
 
         <button
           onClick={() => {
-            fetchStreamConfigs()
-            fetchParkingData()
+            fetchTodayStats()
+            fetchSessions()
+            fetchOrgConfig()
           }}
-          className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium border border-slate-700"
+          className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium border border-slate-700 shrink-0"
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${loadingData ? "animate-spin" : ""}`} />
+          <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
           <span>Sync</span>
         </button>
       </header>
 
-      <main className="flex-1 p-8 max-w-[1600px] w-full mx-auto space-y-6">
-        {/* KPI STRIP */}
-        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
-            <div>
-              <p className="text-xs text-slate-400 uppercase font-medium">Vehicles Inside</p>
-              <p className="text-2xl font-bold text-white mt-1">{activeParkedCount}</p>
+      <main className="flex-1 p-6 max-w-[1650px] w-full mx-auto space-y-6">
+        {/* CURRENT-DAY KPI CARDS */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <p className="text-[11px] text-slate-400 uppercase font-semibold">Today&apos;s Entries</p>
+            <p className="text-2xl font-bold text-emerald-400 mt-1">{todayStats.today_entries}</p>
+            <p className="text-[11px] text-slate-500 mt-0.5">Exits Today: {todayStats.today_exits}</p>
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <p className="text-[11px] text-slate-400 uppercase font-semibold">Vehicles Inside Now</p>
+            <p className="text-2xl font-bold text-white mt-1">{todayStats.currently_parked}</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              2W: {todayStats.occupancy["2W"]?.available ?? 0} free • 4W: {todayStats.occupancy["4W"]?.available ?? 0} free
+            </p>
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <p className="text-[11px] text-slate-400 uppercase font-semibold">Slot Availability</p>
+            <div className="mt-1.5 space-y-1 text-xs">
+              <div className="flex justify-between">
+                <span className="text-slate-400">2-Wheeler:</span>
+                <span className="font-bold text-blue-400">
+                  {todayStats.occupancy["2W"]?.available}/{todayStats.occupancy["2W"]?.total}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">4-Wheeler / HCV:</span>
+                <span className="font-bold text-emerald-400">
+                  {todayStats.occupancy["4W"]?.available}/{todayStats.occupancy["4W"]?.total} •{" "}
+                  {todayStats.occupancy.HCV?.available}/{todayStats.occupancy.HCV?.total}
+                </span>
+              </div>
             </div>
-            <Car className="w-6 h-6 text-emerald-400" />
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
             <div>
-              <p className="text-xs text-slate-400 uppercase font-medium">Whitelisted Vehicles</p>
-              <p className="text-2xl font-bold text-blue-400 mt-1">
-                {rules.filter((r) => r.rule_type === "WHITELIST").length}
-              </p>
-            </div>
-            <ShieldCheck className="w-6 h-6 text-blue-400" />
-          </div>
-
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
-            <div>
-              <p className="text-xs text-slate-400 uppercase font-medium">Security Alerts</p>
-              <p className="text-2xl font-bold text-rose-400 mt-1">{blockedCount}</p>
+              <p className="text-[11px] text-slate-400 uppercase font-semibold">Today&apos;s Alerts</p>
+              <p className="text-2xl font-bold text-rose-400 mt-1">{todayStats.today_alerts}</p>
             </div>
             <ShieldAlert className="w-6 h-6 text-rose-400" />
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
             <div>
-              <p className="text-xs text-slate-400 uppercase font-medium">Tariff Collected</p>
-              <p className="text-2xl font-bold text-amber-400 mt-1">₹{totalRevenue.toFixed(0)}</p>
+              <p className="text-[11px] text-slate-400 uppercase font-semibold">Today&apos;s Collection</p>
+              <p className="text-2xl font-bold text-amber-400 mt-1">₹{todayStats.today_revenue.toFixed(0)}</p>
             </div>
             <IndianRupee className="w-6 h-6 text-amber-400" />
           </div>
         </div>
 
-        {/* TAB 1: DUAL LIVE GATE FEEDS + LIVE ACTIVITY */}
-        {subTab === "gate" && (
-          <div className="space-y-6">
-            {/* ENTRY & EXIT STREAM WALL */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {(["ENTRY", "EXIT"] as const).map((laneKey) => {
-                const cfg = lanes[laneKey]
-                const isEntry = laneKey === "ENTRY"
-                return (
-                  <div key={laneKey} className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center space-x-2">
-                        {isEntry ? (
-                          <LogIn className="w-4 h-4 text-emerald-400" />
-                        ) : (
-                          <LogOut className="w-4 h-4 text-amber-400" />
-                        )}
-                        <h3 className="text-sm font-bold text-white">{laneKey} LANE CAMERA FEED</h3>
-                      </div>
-                      <span
-                        className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                          cfg.is_running
-                            ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 animate-pulse"
-                            : "bg-slate-800 text-slate-400"
-                        }`}
-                      >
-                        {cfg.is_running ? cfg.status_text : "Offline"}
-                      </span>
-                    </div>
-
-                    {/* MJPEG VIDEO VIEWPORT */}
-                    <div className="w-full aspect-video bg-slate-950 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center">
-                      {cfg.is_running ? (
-                        <img
-                          src={`${API_BASE}/v1/stream/feed/${laneKey}?user_id=${user.id}&t=${streamNonce}`}
-                          alt={`${laneKey} Live Feed`}
-                          className="w-full h-full object-contain"
-                        />
-                      ) : (
-                        <div className="text-center space-y-1.5 text-slate-500 px-4">
-                          <Video className="w-7 h-7 mx-auto text-slate-600" />
-                          <p className="text-xs font-semibold text-slate-400">No Active {laneKey} Video Feed</p>
-                          <p className="text-[11px]">
-                            Enter RTSP URL, MP4 video file path, or webcam index (0 / 1) below
-                          </p>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* STREAM SOURCE & TRIPWIRE CONTROLS */}
-                    <div className="space-y-3">
-                      <div className="flex gap-2">
-                        <input
-                          type="text"
-                          placeholder="rtsp://... or /path/to/video.mp4 or 0"
-                          value={cfg.source_url}
-                          onChange={(e) =>
-                            setLanes((prev) => ({
-                              ...prev,
-                              [laneKey]: { ...prev[laneKey], source_url: e.target.value },
-                            }))
-                          }
-                          className="flex-1 px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-white focus:outline-none focus:border-blue-500"
-                        />
-                        {cfg.is_running ? (
-                          <button
-                            onClick={() => handleStopLane(laneKey)}
-                            className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold flex items-center gap-1.5"
-                          >
-                            <Square className="w-3.5 h-3.5" /> Stop
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => handleStartLane(laneKey)}
-                            className={`px-4 py-2 rounded-lg text-white text-xs font-bold flex items-center gap-1.5 ${
-                              isEntry ? "bg-emerald-600 hover:bg-emerald-500" : "bg-amber-600 hover:bg-amber-500"
-                            }`}
-                          >
-                            <Play className="w-3.5 h-3.5" /> Start Feed
-                          </button>
-                        )}
-                      </div>
-
-                      <div className="flex items-center justify-between gap-4 text-xs text-slate-400">
-                        <span className="shrink-0">
-                          Bottom-Edge Tripwire Y: <strong className="text-slate-200">{Math.round(cfg.line_y_ratio * 100)}%</strong>
-                        </span>
-                        <input
-                          type="range"
-                          min={15}
-                          max={90}
-                          value={Math.round(cfg.line_y_ratio * 100)}
-                          onChange={(e) => handleLineSlider(laneKey, Number(e.target.value) / 100)}
-                          className="w-full accent-emerald-500 cursor-pointer"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-
-            {/* LIVE GATE & PARKING ACTIVITY TABLE + OPERATOR OVERRIDE */}
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div>
-                  <h2 className="text-base font-semibold text-white">Live Gate & Parking Activity</h2>
-                  <p className="text-xs text-slate-400">
-                    Auto-updates when a vehicle&apos;s bottom edge crosses ENTRY or EXIT tripwires • Click any row to inspect frame
-                  </p>
-                </div>
-
-                {/* QUICK MANUAL GATE OVERRIDE */}
-                <form onSubmit={handleManualOverride} className="flex items-center gap-2">
-                  <select
-                    value={overrideDir}
-                    onChange={(e) => setOverrideDir(e.target.value as "ENTRY" | "EXIT")}
-                    className="px-2.5 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs font-bold text-white"
-                  >
-                    <option value="ENTRY">ENTRY</option>
-                    <option value="EXIT">EXIT</option>
-                  </select>
-                  <input
-                    type="text"
-                    placeholder="Manual plate override..."
-                    value={overridePlate}
-                    onChange={(e) => setOverridePlate(e.target.value)}
-                    className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono uppercase text-white"
-                  />
-                  <button
-                    type="submit"
-                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs font-semibold text-slate-200"
-                  >
-                    Manual Clear
-                  </button>
-                </form>
+        {/* 1. OPERATIONS DASHBOARD & AUDIT LOGS */}
+        {(subTab === "dashboard" || subTab === "reports") && (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <h2 className="text-base font-semibold text-white">
+                  {subTab === "dashboard" ? "Today's Gate Entry & Exit Log" : "Complete Parking Audit Repository"}
+                </h2>
+                <p className="text-xs text-slate-400">
+                  Click any Entry or Exit frame thumbnail to inspect full-resolution capture
+                </p>
               </div>
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-800 text-[11px] font-semibold uppercase text-slate-400">
-                      <th className="py-3 px-3">Vehicle Plate</th>
-                      <th className="py-3 px-3">Access Type</th>
-                      <th className="py-3 px-3">Entry Time</th>
-                      <th className="py-3 px-3">Exit Time</th>
-                      <th className="py-3 px-3">Duration</th>
-                      <th className="py-3 px-3">Fee</th>
-                      <th className="py-3 px-3">Status</th>
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="relative">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2" />
+                  <input
+                    type="text"
+                    placeholder="Search plate..."
+                    value={searchQuery}
+                    onChange={(e) => {
+                      setSearchQuery(e.target.value)
+                      setPage(1)
+                    }}
+                    className="pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
+                  />
+                </div>
+
+                <select
+                  value={statusFilter}
+                  onChange={(e) => {
+                    setStatusFilter(e.target.value as any)
+                    setPage(1)
+                  }}
+                  className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
+                >
+                  <option value="ALL">All Statuses</option>
+                  <option value="PARKED">Currently Parked</option>
+                  <option value="EXITED">Exited</option>
+                  <option value="BLOCKED">Blocked Alerts</option>
+                </select>
+
+                {subTab === "reports" && (
+                  <button
+                    onClick={exportCSV}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold"
+                  >
+                    <Download className="w-3.5 h-3.5" /> Export CSV
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-800 text-[11px] font-semibold uppercase text-slate-400">
+                    <th className="py-3 px-3">Plate</th>
+                    <th className="py-3 px-3">Type / Access</th>
+                    <th className="py-3 px-3">Entry Image</th>
+                    <th className="py-3 px-3">Entry Gate & Time</th>
+                    <th className="py-3 px-3">Exit Image</th>
+                    <th className="py-3 px-3">Exit Gate & Time</th>
+                    <th className="py-3 px-3">Duration</th>
+                    <th className="py-3 px-3">Fee</th>
+                    <th className="py-3 px-3">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/80 text-xs">
+                  {sessions.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="py-12 text-center text-slate-500">
+                        No gate events recorded for this view.
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/70 text-xs">
-                    {sessions.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} className="py-12 text-center text-slate-500">
-                          No gate events recorded yet. Start ENTRY or EXIT camera feeds to detect vehicles automatically.
+                  ) : (
+                    sessions.map((s) => (
+                      <tr key={s.id} className="hover:bg-slate-800/40">
+                        <td className="py-2.5 px-3">
+                          <IndianPlateBadge plate={s.plate_number} size="sm" />
                         </td>
-                      </tr>
-                    ) : (
-                      sessions.slice(0, 10).map((s) => (
-                        <tr
-                          key={s.id}
-                          onClick={() => s.image_url && setLightboxItem(s)}
-                          className={`hover:bg-slate-800/40 ${s.image_url ? "cursor-pointer" : ""}`}
-                        >
-                          <td className="py-3 px-3">
-                            <IndianPlateBadge plate={s.plate_number} size="sm" />
-                          </td>
-                          <td className="py-3 px-3">
+                        <td className="py-2.5 px-3">
+                          <div className="flex flex-col gap-1">
+                            <span className="font-bold text-slate-200">{s.vehicle_type}</span>
                             <span
-                              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              className={`w-fit px-2 py-0.5 rounded text-[10px] font-bold ${
                                 s.access_type === "WHITELIST"
                                   ? "bg-blue-500/15 text-blue-400"
                                   : s.access_type === "BLACKLIST"
@@ -575,114 +729,16 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
                             >
                               {s.access_type}
                             </span>
-                          </td>
-                          <td className="py-3 px-3 text-slate-400">
-                            {s.entry_time ? new Date(s.entry_time).toLocaleTimeString() : "-"}
-                          </td>
-                          <td className="py-3 px-3 text-slate-400">
-                            {s.exit_time ? new Date(s.exit_time).toLocaleTimeString() : "-"}
-                          </td>
-                          <td className="py-3 px-3 text-slate-300">
-                            <span className="inline-flex items-center gap-1">
-                              <Clock className="w-3 h-3 text-slate-500" />
-                              {s.status === "PARKED" ? "Active" : `${s.duration_mins}m`}
-                            </span>
-                          </td>
-                          <td className="py-3 px-3 font-semibold text-white">₹{s.fee_inr.toFixed(0)}</td>
-                          <td className="py-3 px-3">
-                            <span
-                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                s.status === "PARKED"
-                                  ? "bg-emerald-500/15 text-emerald-400"
-                                  : s.status === "BLOCKED"
-                                  ? "bg-rose-500/15 text-rose-400"
-                                  : "bg-slate-700 text-slate-300"
-                              }`}
-                            >
-                              {s.status}
-                            </span>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 2: FULL PARKING SESSIONS WITH SERVER-SIDE PAGINATION & SEARCH */}
-        {subTab === "sessions" && (
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <h2 className="text-base font-semibold text-white">Complete Parking & Gate Audit Log</h2>
-
-              <div className="flex items-center space-x-3">
-                <div className="relative">
-                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2" />
-                  <input
-                    type="text"
-                    placeholder="Filter by plate..."
-                    value={sessionSearch}
-                    onChange={(e) => {
-                      setSessionSearch(e.target.value)
-                      setPage(1)
-                    }}
-                    className="pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-
-                <select
-                  value={sessionStatusFilter}
-                  onChange={(e) => {
-                    setSessionStatusFilter(e.target.value as any)
-                    setPage(1)
-                  }}
-                  className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white focus:outline-none"
-                >
-                  <option value="ALL">All Statuses</option>
-                  <option value="PARKED">Currently Parked</option>
-                  <option value="EXITED">Exited</option>
-                  <option value="BLOCKED">Blocked Alerts</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-slate-800 text-xs font-semibold uppercase text-slate-400">
-                    <th className="py-3 px-4">ID</th>
-                    <th className="py-3 px-4">Snapshot</th>
-                    <th className="py-3 px-4">Plate Number</th>
-                    <th className="py-3 px-4">Category</th>
-                    <th className="py-3 px-4">Entry</th>
-                    <th className="py-3 px-4">Exit</th>
-                    <th className="py-3 px-4">Duration</th>
-                    <th className="py-3 px-4">Tariff</th>
-                    <th className="py-3 px-4">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800 text-xs">
-                  {sessions.length === 0 ? (
-                    <tr>
-                      <td colSpan={9} className="py-12 text-center text-slate-500">
-                        No matching parking sessions found.
-                      </td>
-                    </tr>
-                  ) : (
-                    sessions.map((s) => (
-                      <tr key={s.id} className="hover:bg-slate-800/40">
-                        <td className="py-3 px-4 text-slate-400">#{s.id}</td>
-                        <td className="py-3 px-4">
-                          {s.image_url ? (
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-3">
+                          {s.entry_image_url ? (
                             <button
-                              onClick={() => setLightboxItem(s)}
+                              onClick={() => setLightboxData({ url: s.entry_image_url, plate: s.plate_number })}
                               className="relative group block rounded overflow-hidden border border-slate-700"
                             >
-                              <img src={s.image_url} alt={s.plate_number} className="w-16 h-10 object-cover" />
-                              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                              <img src={s.entry_image_url} alt="Entry" className="w-16 h-10 object-cover" />
+                              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center">
                                 <Maximize2 className="w-3.5 h-3.5 text-white" />
                               </div>
                             </button>
@@ -690,19 +746,53 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
                             <span className="text-slate-600">—</span>
                           )}
                         </td>
-                        <td className="py-3 px-4">
-                          <IndianPlateBadge plate={s.plate_number} size="sm" />
+                        <td className="py-2.5 px-3 text-slate-300">
+                          <div className="font-medium text-white">{s.entry_gate || "-"}</div>
+                          <div className="text-[11px] text-slate-400">
+                            {s.entry_time ? new Date(s.entry_time).toLocaleString() : "-"}
+                          </div>
                         </td>
-                        <td className="py-3 px-4 text-slate-300">{s.access_type}</td>
-                        <td className="py-3 px-4 text-slate-400">
-                          {s.entry_time ? new Date(s.entry_time).toLocaleString() : "-"}
+                        <td className="py-2.5 px-3">
+                          {s.exit_image_url ? (
+                            <button
+                              onClick={() => setLightboxData({ url: s.exit_image_url, plate: s.plate_number })}
+                              className="relative group block rounded overflow-hidden border border-slate-700"
+                            >
+                              <img src={s.exit_image_url} alt="Exit" className="w-16 h-10 object-cover" />
+                              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center">
+                                <Maximize2 className="w-3.5 h-3.5 text-white" />
+                              </div>
+                            </button>
+                          ) : (
+                            <span className="text-slate-600">—</span>
+                          )}
                         </td>
-                        <td className="py-3 px-4 text-slate-400">
-                          {s.exit_time ? new Date(s.exit_time).toLocaleString() : "-"}
+                        <td className="py-2.5 px-3 text-slate-300">
+                          <div className="font-medium text-white">{s.exit_gate || "-"}</div>
+                          <div className="text-[11px] text-slate-400">
+                            {s.exit_time ? new Date(s.exit_time).toLocaleString() : "-"}
+                          </div>
                         </td>
-                        <td className="py-3 px-4 text-slate-300">{s.duration_mins} mins</td>
-                        <td className="py-3 px-4 font-semibold text-amber-400">₹{s.fee_inr.toFixed(0)}</td>
-                        <td className="py-3 px-4 font-semibold text-white">{s.status}</td>
+                        <td className="py-2.5 px-3 text-slate-300">
+                          <span className="inline-flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-slate-500" />
+                            {s.status === "PARKED" ? "Inside" : `${s.duration_mins}m`}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 font-bold text-amber-400">₹{s.fee_inr.toFixed(0)}</td>
+                        <td className="py-2.5 px-3">
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                              s.status === "PARKED"
+                                ? "bg-emerald-500/15 text-emerald-400"
+                                : s.status === "BLOCKED"
+                                ? "bg-rose-500/15 text-rose-400"
+                                : "bg-slate-700 text-slate-300"
+                            }`}
+                          >
+                            {s.status}
+                          </span>
+                        </td>
                       </tr>
                     ))
                   )}
@@ -710,105 +800,474 @@ export default function ParkingAccessApp({ user, onBackToApps }: ParkingAppProps
               </table>
             </div>
 
-            <PaginationBar
-              page={page}
-              totalPages={totalPages}
-              totalItems={totalItems}
-              pageSize={pageSize}
-              onPageChange={setPage}
-              onPageSizeChange={(sz) => {
-                setPageSize(sz)
-                setPage(1)
-              }}
-            />
+            {subTab === "reports" && (
+              <PaginationBar
+                page={page}
+                totalPages={totalPages}
+                totalItems={totalItems}
+                pageSize={pageSize}
+                onPageChange={setPage}
+                onPageSizeChange={(sz) => {
+                  setPageSize(sz)
+                  setPage(1)
+                }}
+              />
+            )}
           </div>
         )}
 
-        {/* TAB 3: PERSISTENT WHITELIST & BLACKLIST RULES */}
-        {subTab === "rules" && (
+        {/* 2. CAMERA MANAGEMENT SECTION */}
+        {subTab === "cameras" && (
+          <CameraManagerSection userId={user.id} apiBase={API_BASE} onNotify={showToast} />
+        )}
+
+        {/* 3. VEHICLES & OWNERS REGISTRY PAGE */}
+        {subTab === "vehicles" && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             <div className="lg:col-span-4 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
-              <h3 className="text-base font-semibold text-white">Register Vehicle Rule</h3>
-              <p className="text-xs text-slate-400">
-                Saved directly to MySQL (`vehicle_rules`) for automated gate decisions.
-              </p>
-              <form onSubmit={handleAddRule} className="space-y-3">
-                <div>
-                  <label className="block text-xs text-slate-400 mb-1">License Plate</label>
+              <h3 className="text-base font-bold text-white">Register Vehicle & Owner</h3>
+              <form onSubmit={handleRegisterVehicle} className="space-y-3">
+                <input
+                  type="text"
+                  required
+                  placeholder="License Plate (e.g. JH01FW4809)"
+                  value={vForm.plate_number}
+                  onChange={(e) => setVForm({ ...vForm, plate_number: e.target.value })}
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono uppercase text-white"
+                />
+                <input
+                  type="text"
+                  required
+                  placeholder="Owner Full Name"
+                  value={vForm.owner_name}
+                  onChange={(e) => setVForm({ ...vForm, owner_name: e.target.value })}
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
+                />
+                <div className="grid grid-cols-2 gap-2">
                   <input
                     type="text"
-                    required
-                    placeholder="JH01FW4809"
-                    value={newPlate}
-                    onChange={(e) => setNewPlate(e.target.value)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-sm font-mono uppercase text-white"
+                    placeholder="Phone Number"
+                    value={vForm.phone_number}
+                    onChange={(e) => setVForm({ ...vForm, phone_number: e.target.value })}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
+                  />
+                  <input
+                    type="text"
+                    placeholder="Flat / Dept / Unit"
+                    value={vForm.flat_or_unit}
+                    onChange={(e) => setVForm({ ...vForm, flat_or_unit: e.target.value })}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
                   />
                 </div>
-                <div>
-                  <label className="block text-xs text-slate-400 mb-1">Rule Action</label>
+                <div className="grid grid-cols-3 gap-2">
                   <select
-                    value={newRuleType}
-                    onChange={(e) => setNewRuleType(e.target.value as any)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white"
+                    value={vForm.vehicle_type}
+                    onChange={(e) => setVForm({ ...vForm, vehicle_type: e.target.value })}
+                    className="px-2.5 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
                   >
-                    <option value="WHITELIST">Whitelist (Resident / VIP Auto-Open)</option>
-                    <option value="BLACKLIST">Blacklist (Lock Gate & Trigger Alert)</option>
+                    <option value="2W">2-Wheeler</option>
+                    <option value="4W">4-Wheeler</option>
+                    <option value="HCV">Heavy (HCV)</option>
                   </select>
-                </div>
-                <div>
-                  <label className="block text-xs text-slate-400 mb-1">Owner / Note</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Tower B - Flat 304"
-                    value={newLabel}
-                    onChange={(e) => setNewLabel(e.target.value)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white"
-                  />
+                  <select
+                    value={vForm.parking_type}
+                    onChange={(e) => setVForm({ ...vForm, parking_type: e.target.value })}
+                    className="px-2.5 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
+                  >
+                    {orgForm.parking_types.map((pt) => (
+                      <option key={pt} value={pt}>
+                        {pt}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={vForm.access_status}
+                    onChange={(e) => setVForm({ ...vForm, access_status: e.target.value })}
+                    className="px-2.5 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-bold text-white"
+                  >
+                    <option value="WHITELIST">WHITELIST</option>
+                    <option value="BLACKLIST">BLACKLIST</option>
+                  </select>
                 </div>
                 <button
                   type="submit"
-                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-1.5"
+                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-1.5"
                 >
-                  <Plus className="w-4 h-4" /> Save Rule to Database
+                  <Plus className="w-4 h-4" /> Save Vehicle Profile
+                </button>
+              </form>
+            </div>
+
+            <div className="lg:col-span-8 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-base font-bold text-white">Registered Vehicles ({vehicles.length})</h3>
+                <input
+                  type="text"
+                  placeholder="Search plate, owner, unit..."
+                  value={vehSearch}
+                  onChange={(e) => setVehSearch(e.target.value)}
+                  className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white"
+                />
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-[11px] uppercase text-slate-400">
+                      <th className="py-2.5 px-3">Plate</th>
+                      <th className="py-2.5 px-3">Owner & Unit</th>
+                      <th className="py-2.5 px-3">Category</th>
+                      <th className="py-2.5 px-3">Access</th>
+                      <th className="py-2.5 px-3 text-right">Remove</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800">
+                    {vehicles.map((v) => (
+                      <tr key={v.id}>
+                        <td className="py-2.5 px-3">
+                          <IndianPlateBadge plate={v.plate_number} size="sm" />
+                        </td>
+                        <td className="py-2.5 px-3">
+                          <div className="font-semibold text-white">{v.owner_name}</div>
+                          <div className="text-[11px] text-slate-400">
+                            {v.flat_or_unit} {v.phone_number ? `• ${v.phone_number}` : ""}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-3 text-slate-300">
+                          {v.vehicle_type} • {v.parking_type}
+                        </td>
+                        <td className="py-2.5 px-3">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              v.access_status === "WHITELIST"
+                                ? "bg-blue-500/15 text-blue-400"
+                                : "bg-rose-500/15 text-rose-400"
+                            }`}
+                          >
+                            {v.access_status}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 text-right">
+                          <button
+                            onClick={async () => {
+                              await fetch(`${API_BASE}/v1/parking/vehicles/${v.id}`, { method: "DELETE" })
+                              fetchVehicles()
+                            }}
+                            className="text-slate-500 hover:text-rose-400"
+                          >
+                            <Trash2 className="w-4 h-4 inline" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 4. RATE CONFIGURATOR PAGE */}
+        {subTab === "rates" && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-4 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+              <h3 className="text-base font-bold text-white">Configure Tariff Rule</h3>
+              <form onSubmit={handleSaveRate} className="space-y-3 text-xs">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-slate-400 mb-1">Vehicle Type</label>
+                    <select
+                      value={rForm.vehicle_type}
+                      onChange={(e) => setRForm({ ...rForm, vehicle_type: e.target.value })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    >
+                      <option value="2W">2-Wheeler (2W)</option>
+                      <option value="4W">4-Wheeler (4W)</option>
+                      <option value="HCV">Heavy Vehicle (HCV)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 mb-1">Parking Type</label>
+                    <select
+                      value={rForm.parking_type}
+                      onChange={(e) => setRForm({ ...rForm, parking_type: e.target.value })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    >
+                      {orgForm.parking_types.map((pt) => (
+                        <option key={pt} value={pt}>
+                          {pt}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-slate-400 mb-1">Free Grace (mins)</label>
+                    <input
+                      type="number"
+                      value={rForm.grace_period_mins}
+                      onChange={(e) => setRForm({ ...rForm, grace_period_mins: Number(e.target.value) })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 mb-1">Base Slab (hours)</label>
+                    <input
+                      type="number"
+                      value={rForm.base_hours}
+                      onChange={(e) => setRForm({ ...rForm, base_hours: Number(e.target.value) })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="block text-slate-400 mb-1">Base Fee (₹)</label>
+                    <input
+                      type="number"
+                      value={rForm.base_fee_inr}
+                      onChange={(e) => setRForm({ ...rForm, base_fee_inr: Number(e.target.value) })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 mb-1">Extra / Hr (₹)</label>
+                    <input
+                      type="number"
+                      value={rForm.extra_hourly_rate_inr}
+                      onChange={(e) => setRForm({ ...rForm, extra_hourly_rate_inr: Number(e.target.value) })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 mb-1">Daily Cap (₹)</label>
+                    <input
+                      type="number"
+                      value={rForm.daily_max_cap_inr}
+                      onChange={(e) => setRForm({ ...rForm, daily_max_cap_inr: Number(e.target.value) })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    />
+                  </div>
+                </div>
+
+                <label className="flex items-center space-x-2 text-slate-300 pt-1">
+                  <input
+                    type="checkbox"
+                    checked={rForm.is_free_for_whitelist}
+                    onChange={(e) => setRForm({ ...rForm, is_free_for_whitelist: e.target.checked })}
+                    className="accent-emerald-500"
+                  />
+                  <span>Zero tariff (₹0) for Whitelisted vehicles</span>
+                </label>
+
+                <button
+                  type="submit"
+                  className="w-full py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg"
+                >
+                  Save Tariff Rule
                 </button>
               </form>
             </div>
 
             <div className="lg:col-span-8 bg-slate-900 border border-slate-800 rounded-xl p-6">
-              <h3 className="text-base font-semibold text-white mb-4">Active Access Control Rules ({rules.length})</h3>
-              <div className="divide-y divide-slate-800">
-                {rules.length === 0 ? (
-                  <p className="py-8 text-center text-xs text-slate-500">
-                    No rules added yet. Unlisted plates are automatically treated as Visitors (₹20/hr tariff).
-                  </p>
-                ) : (
-                  rules.map((r) => (
-                    <div key={r.id} className="py-3 flex items-center justify-between">
-                      <div className="flex items-center space-x-4">
-                        <IndianPlateBadge plate={r.plate_number} size="sm" />
-                        <span
-                          className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                            r.rule_type === "WHITELIST"
-                              ? "bg-blue-500/15 text-blue-400"
-                              : "bg-rose-500/15 text-rose-400"
-                          }`}
+              <h3 className="text-base font-bold text-white mb-4">Active Rate Matrix ({rates.length})</h3>
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-800 text-[11px] uppercase text-slate-400">
+                    <th className="py-2.5 px-3">Vehicle</th>
+                    <th className="py-2.5 px-3">Parking Type</th>
+                    <th className="py-2.5 px-3">Grace</th>
+                    <th className="py-2.5 px-3">Base Slab</th>
+                    <th className="py-2.5 px-3">Extra / Hr</th>
+                    <th className="py-2.5 px-3">Daily Cap</th>
+                    <th className="py-2.5 px-3 text-right">Delete</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800">
+                  {rates.map((r) => (
+                    <tr key={r.id}>
+                      <td className="py-2.5 px-3 font-bold text-white">{r.vehicle_type}</td>
+                      <td className="py-2.5 px-3 text-blue-400 font-semibold">{r.parking_type}</td>
+                      <td className="py-2.5 px-3 text-slate-300">{r.grace_period_mins} mins</td>
+                      <td className="py-2.5 px-3 text-emerald-400 font-bold">
+                        ₹{r.base_fee_inr} ({r.base_hours}h)
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-300">₹{r.extra_hourly_rate_inr}/hr</td>
+                      <td className="py-2.5 px-3 text-amber-400">₹{r.daily_max_cap_inr}</td>
+                      <td className="py-2.5 px-3 text-right">
+                        <button
+                          onClick={async () => {
+                            await fetch(`${API_BASE}/v1/parking/rates/${r.id}`, { method: "DELETE" })
+                            fetchRates()
+                          }}
+                          className="text-slate-500 hover:text-rose-400"
                         >
-                          {r.rule_type}
-                        </span>
-                        {r.owner_label && <span className="text-xs text-slate-400">{r.owner_label}</span>}
-                      </div>
-                      <button
-                        onClick={() => handleDeleteRule(r.id)}
-                        className="p-1.5 text-slate-500 hover:text-rose-400 transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  ))
-                )}
-              </div>
+                          <Trash2 className="w-4 h-4 inline" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           </div>
+        )}
+
+        {/* 5. ORGANIZATION & CAPACITY CONFIGURATION PAGE */}
+        {subTab === "org" && (
+          <form onSubmit={handleSaveOrg} className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+              <h3 className="text-base font-bold text-white">Organization Details</h3>
+              <div className="space-y-3 text-xs">
+                <div>
+                  <label className="block text-slate-400 mb-1">Organization / Site Name</label>
+                  <input
+                    type="text"
+                    required
+                    value={orgForm.org_name}
+                    onChange={(e) => setOrgForm({ ...orgForm, org_name: e.target.value })}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">Site Address</label>
+                  <input
+                    type="text"
+                    value={orgForm.address}
+                    onChange={(e) => setOrgForm({ ...orgForm, address: e.target.value })}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-slate-400 mb-1">Contact Phone</label>
+                    <input
+                      type="text"
+                      value={orgForm.contact_phone}
+                      onChange={(e) => setOrgForm({ ...orgForm, contact_phone: e.target.value })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 mb-1">GSTIN (Optional)</label>
+                    <input
+                      type="text"
+                      value={orgForm.gst_number}
+                      onChange={(e) => setOrgForm({ ...orgForm, gst_number: e.target.value })}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-slate-800 space-y-2">
+                <label className="block text-xs font-semibold text-slate-300">Parking Zones / Types</label>
+                <div className="flex flex-wrap gap-1.5">
+                  {orgForm.parking_types.map((pt) => (
+                    <span
+                      key={pt}
+                      className="px-2.5 py-1 rounded-md bg-slate-800 text-xs font-bold text-blue-300 flex items-center gap-1.5"
+                    >
+                      {pt}
+                      {orgForm.parking_types.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setOrgForm({
+                              ...orgForm,
+                              parking_types: orgForm.parking_types.filter((x) => x !== pt),
+                            })
+                          }
+                          className="text-slate-400 hover:text-rose-400"
+                        >
+                          ×
+                        </button>
+                      )}
+                    </span>
+                  ))}
+                </div>
+                <div className="flex gap-2 pt-1">
+                  <input
+                    type="text"
+                    placeholder="Add zone (e.g. STAFF)"
+                    value={newParkingType}
+                    onChange={(e) => setNewParkingType(e.target.value)}
+                    className="flex-1 px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs uppercase text-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const clean = newParkingType.trim().toUpperCase()
+                      if (clean && !orgForm.parking_types.includes(clean)) {
+                        setOrgForm({ ...orgForm, parking_types: [...orgForm.parking_types, clean] })
+                        setNewParkingType("")
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg text-xs font-bold text-white"
+                  >
+                    Add Type
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+              <h3 className="text-base font-bold text-white">Slot Capacity Matrix (Vehicle Type × Parking Type)</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-[11px] uppercase text-slate-400">
+                      <th className="py-2.5 px-3">Vehicle Category</th>
+                      {orgForm.parking_types.map((pt) => (
+                        <th key={pt} className="py-2.5 px-3">
+                          {pt} Slots
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800">
+                    {(["2W", "4W", "HCV"] as const).map((vt) => (
+                      <tr key={vt}>
+                        <td className="py-3 px-3 font-bold text-white">
+                          {vt === "2W" ? "2-Wheeler (2W)" : vt === "4W" ? "4-Wheeler (4W)" : "Heavy Vehicle (HCV)"}
+                        </td>
+                        {orgForm.parking_types.map((pt) => (
+                          <td key={pt} className="py-3 px-3">
+                            <input
+                              type="number"
+                              min={0}
+                              value={orgForm.slots?.[vt]?.[pt] ?? 0}
+                              onChange={(e) => {
+                                const val = Math.max(0, Number(e.target.value))
+                                setOrgForm({
+                                  ...orgForm,
+                                  slots: {
+                                    ...orgForm.slots,
+                                    [vt]: { ...(orgForm.slots?.[vt] || {}), [pt]: val },
+                                  },
+                                })
+                              }}
+                              className="w-20 px-2.5 py-1.5 bg-slate-950 border border-slate-700 rounded text-white font-mono"
+                            />
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <button
+                type="submit"
+                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg"
+              >
+                Save Organization & Slot Capacity
+              </button>
+            </div>
+          </form>
         )}
       </main>
     </div>

@@ -205,6 +205,7 @@ class RegisteredVehicle(Base):
     valid_until = Column(String(32), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
+
 class CameraLaneConfig(Base):
     __tablename__ = "camera_lane_configs"
 

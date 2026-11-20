@@ -7,6 +7,8 @@ from rapidocr_onnxruntime import RapidOCR
 from app.core.celery_app import celery
 from app.core.config import settings
 from app.core.database import SessionLocal, ANPRLog
+from datetime import datetime, timezone
+import math
 
 # MUTE WARNINGS
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only=False.*")
@@ -290,6 +292,7 @@ def get_all_candidates_from_blocks(blocks):
     return all_candidates
 
 # MAIN CELERY WORKER TASK
+
 @celery.task(name="process_anpr_pipeline")
 def process_anpr_pipeline(
     task_id: str,
@@ -297,6 +300,7 @@ def process_anpr_pipeline(
     user_id: int,
     app_source: str = "snapshot",
     gate_direction: str | None = None,
+    gate_name: str | None = None,
 ):
     print(f"\n[Worker] 📥 Picked up task {task_id} | Analyzing {len(file_paths)} frames for User {user_id}")
     
@@ -382,11 +386,15 @@ def process_anpr_pipeline(
     db = SessionLocal()
     try:
         primary_image = file_paths[0] if file_paths else ""
+        web_image_path = primary_image
+        if "/uploads/" in primary_image:
+            web_image_path = "/uploads/" + primary_image.split("/uploads/", 1)[1]
+
         new_log = ANPRLog(
             user_id=user_id,
             app_source=app_source,
             task_id=task_id,
-            image_path=primary_image,
+            image_path=web_image_path,
             plate_number=plate_text,
             category=category,
             confidence=confidence_val,
@@ -395,15 +403,140 @@ def process_anpr_pipeline(
         db.add(new_log)
         db.commit()
 
-        if gate_direction in ("ENTRY", "EXIT"):
-            from app.api.parking import process_gate_decision
-            process_gate_decision(
-                db=db,
-                user_id=user_id,
-                plate_number=plate_text,
-                direction=gate_direction,
-                image_path=primary_image,
+        if db_status == "success" and (gate_direction is not None or app_source == "parking"):
+            from app.core.database import ParkingSession, RegisteredVehicle, VehicleRule, RateConfig
+
+            if isinstance(gate_direction, dict):
+                raw_dir = gate_direction.get("direction") or gate_direction.get("gate_type") or gate_direction.get("lane") or "ENTRY"
+                gate_name = gate_name or gate_direction.get("gate_name") or gate_direction.get("name")
+            else:
+                raw_dir = gate_direction or "ENTRY"
+
+            direction = str(raw_dir).strip().upper()
+            clean_plate = plate_text.strip().upper()
+
+            reg = (
+                db.query(RegisteredVehicle)
+                .filter(RegisteredVehicle.user_id == user_id, RegisteredVehicle.plate_number == clean_plate)
+                .first()
             )
+            legacy_rule = (
+                db.query(VehicleRule)
+                .filter(VehicleRule.user_id == user_id, VehicleRule.plate_number == clean_plate)
+                .first()
+            )
+
+            vehicle_type = reg.vehicle_type if reg else "4W"
+            parking_type = reg.parking_type if reg else "VISITOR"
+
+            if reg:
+                access_type = reg.access_status
+            elif legacy_rule:
+                access_type = legacy_rule.rule_type
+            else:
+                access_type = "VISITOR"
+
+            if access_type == "BLACKLIST":
+                blocked = ParkingSession(
+                    user_id=user_id,
+                    plate_number=clean_plate,
+                    vehicle_type=vehicle_type,
+                    parking_type=parking_type,
+                    access_type="BLACKLIST",
+                    gate_action="LOCKED",
+                    entry_gate=gate_name if direction == "ENTRY" else None,
+                    exit_gate=gate_name if direction == "EXIT" else None,
+                    entry_image=web_image_path,
+                    status="BLOCKED",
+                )
+                db.add(blocked)
+                db.commit()
+            elif direction == "ENTRY":
+                existing = (
+                    db.query(ParkingSession)
+                    .filter(
+                        ParkingSession.user_id == user_id,
+                        ParkingSession.plate_number == clean_plate,
+                        ParkingSession.status == "PARKED",
+                    )
+                    .first()
+                )
+                if not existing:
+                    session = ParkingSession(
+                        user_id=user_id,
+                        plate_number=clean_plate,
+                        vehicle_type=vehicle_type,
+                        parking_type=parking_type,
+                        access_type=access_type,
+                        gate_action="OPENED",
+                        entry_gate=gate_name or "Entry Gate",
+                        entry_image=web_image_path,
+                        status="PARKED",
+                    )
+                    db.add(session)
+                    db.commit()
+            elif direction == "EXIT":
+                active = (
+                    db.query(ParkingSession)
+                    .filter(
+                        ParkingSession.user_id == user_id,
+                        ParkingSession.plate_number == clean_plate,
+                        ParkingSession.status == "PARKED",
+                    )
+                    .order_by(ParkingSession.entry_time.desc())
+                    .first()
+                )
+                now_utc = datetime.now(timezone.utc)
+                if active:
+                    entry_dt = active.entry_time
+                    if entry_dt.tzinfo is None:
+                        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                    mins = max(1, int((now_utc - entry_dt).total_seconds() // 60))
+
+                    rate = (
+                        db.query(RateConfig)
+                        .filter(
+                            RateConfig.user_id == user_id,
+                            RateConfig.vehicle_type == active.vehicle_type,
+                            RateConfig.parking_type == active.parking_type,
+                        )
+                        .first()
+                    )
+                    fee = 0.0
+                    if rate:
+                        if not (active.access_type == "WHITELIST" and rate.is_free_for_whitelist):
+                            if mins > rate.grace_period_mins:
+                                total_hours = math.ceil(mins / 60.0)
+                                extra_hours = max(0, total_hours - rate.base_hours)
+                                raw_fee = rate.base_fee_inr + (extra_hours * rate.extra_hourly_rate_inr)
+                                fee = min(raw_fee, rate.daily_max_cap_inr)
+
+                    active.exit_time = now_utc
+                    active.exit_gate = gate_name or "Exit Gate"
+                    active.exit_image = web_image_path
+                    active.duration_mins = mins
+                    active.fee_inr = round(fee, 2)
+                    active.status = "EXITED"
+                    db.commit()
+                else:
+                    exited = ParkingSession(
+                        user_id=user_id,
+                        plate_number=clean_plate,
+                        vehicle_type=vehicle_type,
+                        parking_type=parking_type,
+                        access_type=access_type,
+                        gate_action="OPENED",
+                        exit_gate=gate_name or "Exit Gate",
+                        entry_time=now_utc,
+                        exit_time=now_utc,
+                        exit_image=web_image_path,
+                        duration_mins=0,
+                        fee_inr=0.0,
+                        status="EXITED",
+                    )
+                    db.add(exited)
+                    db.commit()
+
     except Exception as e:
         db.rollback()
         print(f"[Worker] Database Error: {e}")

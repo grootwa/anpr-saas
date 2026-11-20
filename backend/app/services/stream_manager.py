@@ -10,6 +10,11 @@ from ultralytics import YOLO
 from app.core.config import settings
 from app.worker.tasks import process_anpr_pipeline
 
+# Force TCP RTSP + 5s socket timeout (stimeout in microseconds) before any VideoCapture call
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|stimeout;5000000|fflags;nobuffer|flags;low_delay|max_delay;500000"
+)
+
 # COCO vehicle classes: 2=car, 3=motorcycle, 5=bus, 7=truck
 VEHICLE_CLASS_MAP = {
     3: "2W",
@@ -17,6 +22,9 @@ VEHICLE_CLASS_MAP = {
     5: "HCV",
     7: "HCV",
 }
+
+# Global lock to serialize YOLO model instantiation safely across camera threads
+_MODEL_INIT_LOCK = threading.Lock()
 
 
 class CameraStreamWorker:
@@ -43,15 +51,24 @@ class CameraStreamWorker:
         self.status_text = "Initializing..."
         self.latest_jpeg: bytes | None = None
         self.last_preview_request: float = 0.0
+
+        # Latest raw frame buffer updated by dedicated grabber thread (prevents RTSP lag)
+        self._raw_frame: np.ndarray | None = None
+        self._raw_frame_seq: int = 0
+        self._frame_lock = threading.Lock()
+
         self.lock = threading.Lock()
-        self.thread: threading.Thread | None = None
+        self.grab_thread: threading.Thread | None = None
+        self.infer_thread: threading.Thread | None = None
 
     def start(self):
         if self.running:
             return
         self.running = True
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
-        self.thread.start()
+        self.grab_thread = threading.Thread(target=self._grab_loop, daemon=True)
+        self.infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
+        self.grab_thread.start()
+        self.infer_thread.start()
 
     def stop(self):
         self.running = False
@@ -78,6 +95,14 @@ class CameraStreamWorker:
             max(0.0, min(1.0, float(y2))),
         )
 
+    def _open_capture(self, source):
+        if isinstance(source, int):
+            cap = cv2.VideoCapture(source)
+        else:
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
     def _make_placeholder_jpeg(self, msg: str) -> bytes:
         canvas = np.zeros((360, 640, 3), dtype=np.uint8)
         canvas[:] = (15, 23, 42)
@@ -102,9 +127,7 @@ class CameraStreamWorker:
         seg_len_sq = dx * dx + dy * dy
         if seg_len_sq < 1e-6:
             return 0.0, False
-        # Cross product gives signed side of line
         side = dx * (py - y1) - dy * (px - x1)
-        # Projection t checks if point lies along segment span
         t = ((px - x1) * dx + (py - y1) * dy) / seg_len_sq
         pad = margin / (seg_len_sq ** 0.5)
         within = (-pad) <= t <= (1.0 + pad)
@@ -119,32 +142,27 @@ class CameraStreamWorker:
             saved_paths.append(path)
 
         if saved_paths:
-            # Compatible with existing tasks.py signature (5th arg can be dict or str)
             gate_payload = {
                 "direction": self.gate_type,
                 "gate_label": f"{self.gate_no} ({self.gate_name})",
                 "vehicle_type": vehicle_type,
             }
-            process_anpr_pipeline.delay(
-                task_id,
-                saved_paths,
-                self.user_id,
-                "parking",
-                gate_payload,
-            )
+            try:
+                process_anpr_pipeline.delay(
+                    task_id,
+                    saved_paths,
+                    self.user_id,
+                    "parking",
+                    gate_payload,
+                )
+            except Exception as exc:
+                print(f"[StreamManager] Celery dispatch error on cam {self.camera_id}: {exc}")
 
-    def _run_loop(self):
-        model_path = os.getenv("VEHICLE_TRACK_MODEL", "yolo11n.pt")
-        vehicle_conf = float(os.getenv("VEHICLE_CONF", "0.40"))
-        model = YOLO(model_path)
-
+    def _grab_loop(self):
+        """Dedicated wire-speed RTSP reader so decoder buffers never back up."""
         source = int(self.source_url) if self.source_url.isdigit() else self.source_url
-        cap = cv2.VideoCapture(source)
-
-        prev_side: dict[int, float] = {}
-        pre_cross_buffer: dict[int, deque] = defaultdict(lambda: deque(maxlen=2))
-        triggered_ids: set[int] = set()
-        post_cross_collect: dict[int, tuple[str, list]] = {}
+        is_local_file = isinstance(source, str) and os.path.exists(source)
+        cap = self._open_capture(source)
 
         while self.running:
             if not cap.isOpened():
@@ -153,16 +171,15 @@ class CameraStreamWorker:
                 with self.lock:
                     self.latest_jpeg = self._make_placeholder_jpeg(f"Connecting to {self.source_url}...")
                 time.sleep(2.0)
-                cap.open(source)
+                cap.release()
+                cap = self._open_capture(source)
                 continue
 
-            ret, full_frame = cap.read()
-            if not ret:
-                if isinstance(source, str) and os.path.exists(source):
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                if is_local_file:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    prev_side.clear()
-                    triggered_ids.clear()
-                    post_cross_collect.clear()
+                    time.sleep(0.03)
                     continue
 
                 self.connected = False
@@ -171,12 +188,53 @@ class CameraStreamWorker:
                     self.latest_jpeg = self._make_placeholder_jpeg("Stream interrupted. Reconnecting...")
                 cap.release()
                 time.sleep(2.0)
-                cap = cv2.VideoCapture(source)
+                cap = self._open_capture(source)
                 continue
 
             self.connected = True
             self.status_text = "LIVE"
+            with self._frame_lock:
+                self._raw_frame = frame
+                self._raw_frame_seq += 1
 
+            # Pace local video files to ~25 FPS; live RTSP already paces via network arrival
+            if is_local_file:
+                time.sleep(0.04)
+            else:
+                time.sleep(0.005)
+
+        cap.release()
+
+    def _infer_loop(self):
+        """Processes the latest grabbed frame with ByteTrack and tripwire crossing detection."""
+        model_path = os.getenv("VEHICLE_TRACK_MODEL", "yolo11n.pt")
+        vehicle_conf = float(os.getenv("VEHICLE_CONF", "0.60"))
+
+        with _MODEL_INIT_LOCK:
+            model = YOLO(model_path)
+
+        prev_side: dict[int, float] = {}
+        pre_cross_buffer: dict[int, deque] = defaultdict(lambda: deque(maxlen=2))
+        triggered_ids: set[int] = set()
+        post_cross_collect: dict[int, tuple[str, list]] = {}
+        last_seen_ts: dict[int, float] = {}
+
+        last_processed_seq = -1
+        last_cleanup_ts = time.time()
+
+        while self.running:
+            with self._frame_lock:
+                if self._raw_frame is None or self._raw_frame_seq == last_processed_seq:
+                    full_frame = None
+                else:
+                    full_frame = self._raw_frame.copy()
+                    last_processed_seq = self._raw_frame_seq
+
+            if full_frame is None:
+                time.sleep(0.015)
+                continue
+
+            now = time.time()
             orig_h, orig_w = full_frame.shape[:2]
             proc_w = 640
             scale = proc_w / float(orig_w) if orig_w > proc_w else 1.0
@@ -191,17 +249,21 @@ class CameraStreamWorker:
             px1, py1 = int(lx1 * w), int(ly1 * h)
             px2, py2 = int(lx2 * w), int(ly2 * h)
 
-            results = model.track(
-                proc_frame,
-                conf=vehicle_conf,
-                classes=list(VEHICLE_CLASS_MAP.keys()),
-                persist=True,
-                tracker="bytetrack.yaml",
-                verbose=False,
-            )
+            try:
+                results = model.track(
+                    proc_frame,
+                    conf=vehicle_conf,
+                    classes=list(VEHICLE_CLASS_MAP.keys()),
+                    persist=True,
+                    tracker="bytetrack.yaml",
+                    verbose=False,
+                )
+            except Exception as exc:
+                print(f"[StreamManager] Tracking error on cam {self.camera_id}: {exc}")
+                time.sleep(0.05)
+                continue
 
-            # Encode preview JPEG ONLY if Camera Management UI requested a frame in the last 3 seconds
-            render_preview = (time.time() - self.last_preview_request) < 3.0
+            render_preview = (now - self.last_preview_request) < 3.0
             if render_preview:
                 line_color = (16, 185, 129) if self.gate_type == "ENTRY" else (245, 158, 11)
                 cv2.line(proc_frame, (px1, py1), (px2, py2), line_color, 2)
@@ -214,6 +276,7 @@ class CameraStreamWorker:
                 cls_ids = results[0].boxes.cls.int().cpu().tolist()
 
                 for box, tid, cls_id in zip(boxes, track_ids, cls_ids):
+                    last_seen_ts[tid] = now
                     v_type = VEHICLE_CLASS_MAP.get(cls_id, "4W")
                     x1, y1, x2, y2 = map(int, box)
                     bottom_cx = (x1 + x2) / 2.0
@@ -226,7 +289,7 @@ class CameraStreamWorker:
                         vt, frames_list = post_cross_collect[tid]
                         frames_list.append(full_frame.copy())
                         if len(frames_list) >= 3:
-                            post_cross_collect.pop(tid)
+                            post_cross_collect.pop(tid, None)
                             self._dispatch_burst(tid, frames_list, vt)
 
                     curr_side, within_seg = self._signed_side_and_within_segment(
@@ -237,7 +300,7 @@ class CameraStreamWorker:
                         ps = prev_side[tid]
                         if (ps < 0 <= curr_side) or (ps > 0 >= curr_side):
                             triggered_ids.add(tid)
-                            seed = list(pre_cross_buffer[tid]) or [full_frame.copy()]
+                            seed = list(pre_cross_buffer.pop(tid, [])) or [full_frame.copy()]
                             post_cross_collect[tid] = (v_type, seed)
 
                     prev_side[tid] = curr_side
@@ -262,9 +325,19 @@ class CameraStreamWorker:
                     with self.lock:
                         self.latest_jpeg = buf.tobytes()
 
-            time.sleep(0.01)
+            # Periodically prune stale track IDs (> 6s unseen) to keep memory flat 24/7
+            if now - last_cleanup_ts > 5.0:
+                stale_ids = [tid for tid, ts in last_seen_ts.items() if now - ts > 6.0]
+                for tid in stale_ids:
+                    last_seen_ts.pop(tid, None)
+                    prev_side.pop(tid, None)
+                    pre_cross_buffer.pop(tid, None)
+                    triggered_ids.discard(tid)
+                    post_cross_collect.pop(tid, None)
+                last_cleanup_ts = now
 
-        cap.release()
+            # Yield GIL so FastAPI HTTP requests always stay snappy
+            time.sleep(0.015)
 
 
 class StreamManager:
